@@ -124,23 +124,31 @@ build_new_vms() {
 
     # 询问系统
     _blue "支持的系统 / Supported systems:"
-    _blue "  1. debian (default)    2. ubuntu"
-    _blue "  3. almalinux           4. rockylinux"
+    _blue "  1. debian12 (default)  2. ubuntu22"
+    _blue "  3. almalinux9          4. rockylinux9"
     _blue "  5. openeuler"
-    reading "系统类型 (system type) [default: debian]: " system_type
-    [[ -z "$system_type" ]] && system_type="debian"
+    _blue "  可指定版本 / Version examples:"
+    _blue "    debian: debian10 debian11 debian12 debian13"
+    _blue "    ubuntu: ubuntu18 ubuntu20 ubuntu22 ubuntu24"
+    _blue "    almalinux: almalinux8 almalinux9"
+    _blue "    rockylinux: rockylinux8 rockylinux9"
+    reading "系统类型 (system type) [default: debian12]: " system_type
+    [[ -z "$system_type" ]] && system_type="debian12"
     system_type=$(echo "$system_type" | tr '[:upper:]' '[:lower:]')
     # 支持数字选择
     case "$system_type" in
-        1) system_type="debian" ;;
-        2) system_type="ubuntu" ;;
-        3) system_type="almalinux" ;;
-        4) system_type="rockylinux" ;;
+        1) system_type="debian12" ;;
+        2) system_type="ubuntu22" ;;
+        3) system_type="almalinux9" ;;
+        4) system_type="rockylinux9" ;;
         5) system_type="openeuler" ;;
     esac
-    if [[ ! "$system_type" =~ ^(debian|ubuntu|almalinux|rockylinux|openeuler)$ ]]; then
-        _yellow "Unknown system '${system_type}', using debian"
-        system_type="debian"
+    # 验证系统名称（只检查名称部分，版本由 oneqemu.sh 解析）
+    local en_check
+    en_check=$(echo "$system_type" | tr -d '-_' | sed 's/[0-9]*$//' | sed 's/^alma$/almalinux/' | sed 's/^rocky$/rockylinux/' | sed 's/^euler$/openeuler/')
+    if [[ ! "$en_check" =~ ^(debian|ubuntu|almalinux|rockylinux|openeuler)$ ]]; then
+        _yellow "Unknown system '${system_type}', using debian12"
+        system_type="debian12"
     fi
 
     _blue "======================================================"

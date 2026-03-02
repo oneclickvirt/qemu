@@ -155,91 +155,153 @@ if ! command -v virt-install >/dev/null 2>&1; then
     exit 1
 fi
 
-# ======== 标准化 system 名称 ========
+# ======== 解析 system 名称与版本 ========
+# 支持格式：debian / debian12 / debian-12 / ubuntu22 / ubuntu2204 / almalinux9 / rocky8 等
 system=$(echo "$system" | tr '[:upper:]' '[:lower:]')
+
+# 规范化别名（alma→almalinux，rocky→rockylinux，euler→openeuler）
 case "$system" in
-    debian|debian12|debian-12)
-        system="debian"
-        os_info="debian12"
-        ;;
-    ubuntu|ubuntu24|ubuntu-24|ubuntu2404)
-        system="ubuntu"
-        os_info="ubuntu24.04"
-        ;;
-    almalinux|alma|almalinux9|alma9)
-        system="almalinux"
-        os_info="almalinux9"
-        ;;
-    rockylinux|rocky|rocky9|rockylinux9)
-        system="rockylinux"
-        os_info="rhel9.0"
-        ;;
-    openeuler|euler)
-        system="openeuler"
-        os_info="rhel8.0"
-        ;;
+    alma*) system=$(echo "$system" | sed 's/^alma/almalinux/') ;;
+    rocky*) system=$(echo "$system" | sed 's/^rocky/rockylinux/') ;;
+    euler*) system="openeuler" ;;
+esac
+
+# 去掉分隔符（ubuntu-22→ubuntu22，ubuntu_22→ubuntu22）
+system=$(echo "$system" | tr -d '-_')
+
+# 4 位 Ubuntu 版本号缩短（ubuntu2204→ubuntu22，ubuntu2404→ubuntu24）
+system=$(echo "$system" | sed 's/^\(ubuntu\)\([0-9][0-9]\)[0-9][0-9]$/\1\2/')
+
+# 拆分名称部分与版本部分
+en_system=$(echo "$system" | sed 's/[0-9]*$//')
+num_system=$(echo "$system" | sed 's/^[a-z]*//')
+
+# 验证系统名称
+case "$en_system" in
+    debian|ubuntu|almalinux|rockylinux|openeuler) ;;
     *)
-        _yellow "Unknown system '${system}', using debian"
-        system="debian"
-        os_info="debian12"
+        _yellow "Unknown system '${system}', using debian12"
+        en_system="debian"
+        num_system="12"
         ;;
+esac
+
+# 没有指定版本时使用默认版本
+if [[ -z "$num_system" ]]; then
+    case "$en_system" in
+        debian)     num_system="12" ;;
+        ubuntu)     num_system="22" ;;
+        almalinux)  num_system="9"  ;;
+        rockylinux) num_system="9"  ;;
+        openeuler)  num_system="22" ;;
+    esac
+fi
+
+# 拼接标准名称（用于镜像文件缓存命名及下载版本 ID）
+system="${en_system}${num_system}"
+
+# 设置 virt-install 使用的 os-variant
+case "$en_system" in
+    debian)
+        case "$num_system" in
+            10) os_info="debian10" ;;
+            11) os_info="debian11" ;;
+            12) os_info="debian12" ;;
+            13) os_info="debian13" ;;
+            *)  os_info="debian12" ;;
+        esac ;;
+    ubuntu)
+        case "$num_system" in
+            18) os_info="ubuntu18.04" ;;
+            20) os_info="ubuntu20.04" ;;
+            22) os_info="ubuntu22.04" ;;
+            24) os_info="ubuntu24.04" ;;
+            *)  os_info="ubuntu22.04" ;;
+        esac ;;
+    almalinux)
+        case "$num_system" in
+            8)  os_info="almalinux8" ;;
+            9)  os_info="almalinux9" ;;
+            *)  os_info="almalinux9" ;;
+        esac ;;
+    rockylinux)
+        case "$num_system" in
+            8)  os_info="rhel8.0" ;;
+            9)  os_info="rhel9.0" ;;
+            *)  os_info="rhel9.0" ;;
+        esac ;;
+    openeuler)
+        os_info="rhel8.0" ;;
 esac
 
 # ======== cloud 镜像官方回退 URL 映射 ========
 # 仅在组织预置镜像下载失败时使用
+# 参数：en_sys（系统名称，如 debian），num_sys（版本号，如 12），arch（amd64/arm64）
 get_official_image_url() {
-    local sys="$1"
-    local arch="$2"
+    local en_sys="$1"
+    local num_sys="$2"
+    local arch="$3"
     CLOUD_IMG_URL=""
-    case "$sys" in
+    case "$en_sys" in
         debian)
+            local codename
+            case "$num_sys" in
+                10) codename="buster"   ;;
+                11) codename="bullseye" ;;
+                12) codename="bookworm" ;;
+                13) codename="trixie"   ;;
+                *)  codename="bookworm"; num_sys="12" ;;
+            esac
             if [[ "$arch" == "arm64" ]]; then
-                CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
+                CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/${codename}/latest/debian-${num_sys}-generic-arm64.qcow2"
             else
-                CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+                CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/${codename}/latest/debian-${num_sys}-generic-amd64.qcow2"
             fi
             ;;
         ubuntu)
+            local codename full_ver
+            case "$num_sys" in
+                18) codename="bionic"; full_ver="18.04" ;;
+                20) codename="focal";  full_ver="20.04" ;;
+                22) codename="jammy";  full_ver="22.04" ;;
+                24) codename="noble";  full_ver="24.04" ;;
+                *)  codename="jammy";  full_ver="22.04" ;;
+            esac
             if [[ "$arch" == "arm64" ]]; then
-                CLOUD_IMG_URL="https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-arm64.img"
+                CLOUD_IMG_URL="https://cloud-images.ubuntu.com/minimal/releases/${codename}/release/ubuntu-${full_ver}-minimal-cloudimg-arm64.img"
             else
-                CLOUD_IMG_URL="https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-amd64.img"
+                CLOUD_IMG_URL="https://cloud-images.ubuntu.com/minimal/releases/${codename}/release/ubuntu-${full_ver}-minimal-cloudimg-amd64.img"
             fi
             ;;
         almalinux)
+            local ver="${num_sys:-9}"
             if [[ "$arch" == "arm64" ]]; then
-                CLOUD_IMG_URL="https://repo.almalinux.org/almalinux/9/cloud/aarch64/images/AlmaLinux-9-GenericCloud-latest.aarch64.qcow2"
+                CLOUD_IMG_URL="https://repo.almalinux.org/almalinux/${ver}/cloud/aarch64/images/AlmaLinux-${ver}-GenericCloud-latest.aarch64.qcow2"
             else
-                CLOUD_IMG_URL="https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+                CLOUD_IMG_URL="https://repo.almalinux.org/almalinux/${ver}/cloud/x86_64/images/AlmaLinux-${ver}-GenericCloud-latest.x86_64.qcow2"
             fi
             ;;
         rockylinux)
+            local ver="${num_sys:-9}"
             if [[ "$arch" == "arm64" ]]; then
-                CLOUD_IMG_URL="https://dl.rockylinux.org/pub/rocky/9/images/aarch64/Rocky-9-GenericCloud-Base.latest.aarch64.qcow2"
+                CLOUD_IMG_URL="https://dl.rockylinux.org/pub/rocky/${ver}/images/aarch64/Rocky-${ver}-GenericCloud-Base.latest.aarch64.qcow2"
             else
-                CLOUD_IMG_URL="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+                CLOUD_IMG_URL="https://dl.rockylinux.org/pub/rocky/${ver}/images/x86_64/Rocky-${ver}-GenericCloud-Base.latest.x86_64.qcow2"
             fi
             ;;
         openeuler)
+            local eu_ver
+            case "$num_sys" in
+                20) eu_ver="20.03-LTS-SP3" ;;
+                22) eu_ver="22.03-LTS-SP3" ;;
+                *)  eu_ver="22.03-LTS-SP3" ;;
+            esac
             if [[ "$arch" == "arm64" ]]; then
-                CLOUD_IMG_URL="https://repo.openeuler.org/openEuler-22.03-LTS-SP3/virtual_machine_img/aarch64/openEuler-22.03-LTS-SP3-aarch64.qcow2.xz"
+                CLOUD_IMG_URL="https://repo.openeuler.org/openEuler-${eu_ver}/virtual_machine_img/aarch64/openEuler-${eu_ver}-aarch64.qcow2.xz"
             else
-                CLOUD_IMG_URL="https://repo.openeuler.org/openEuler-22.03-LTS-SP3/virtual_machine_img/x86_64/openEuler-22.03-LTS-SP3-x86_64.qcow2.xz"
+                CLOUD_IMG_URL="https://repo.openeuler.org/openEuler-${eu_ver}/virtual_machine_img/x86_64/openEuler-${eu_ver}-x86_64.qcow2.xz"
             fi
             ;;
-    esac
-}
-
-# ======== 组织预置镜像版本映射 ========
-# 返回 oneclickvirt 组织 kvm_images 系列 repo 中对应的版本标签
-get_org_image_ver() {
-    local sys="$1"
-    case "$sys" in
-        debian)     echo "debian12" ;;
-        ubuntu)     echo "ubuntu22" ;;
-        almalinux)  echo "almalinux9" ;;
-        rockylinux) echo "rockylinux9" ;;
-        *)          echo "" ;;
     esac
 }
 
@@ -255,9 +317,10 @@ try_pve_kvm_images() {
     _yellow "Trying oneclickvirt/pve_kvm_images for ${ver}..."
 
     # 直接按已知 URL 模式尝试，不依赖 GitHub API
+    # 优先使用 tag=<sys> 的系统专项 release，次优先使用 tag=images 的通用 release
     local candidate_urls=(
-        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
         "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${ver}.qcow2"
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
     )
 
     for base_url in "${candidate_urls[@]}"; do
@@ -327,20 +390,17 @@ download_cloud_image() {
     _yellow "Base image not cached, downloading for system '${system}'..."
 
     # ---- 1. 尝试组织预置镜像 ----
-    local org_ver
-    org_ver=$(get_org_image_ver "$system")
-    if [[ -n "$org_ver" ]]; then
-        if try_pve_kvm_images "$org_ver" "$img_path" "$system"; then
-            return 0
-        fi
-        if try_kvm_images "$org_ver" "$img_path"; then
-            return 0
-        fi
-        _yellow "Org images unavailable, falling back to official upstream..."
+    # system 已包含版本（如 debian12），en_system 为名称部分（如 debian）
+    if try_pve_kvm_images "$system" "$img_path" "$en_system"; then
+        return 0
     fi
+    if try_kvm_images "$system" "$img_path"; then
+        return 0
+    fi
+    _yellow "Org images unavailable, falling back to official upstream..."
 
     # ---- 2. 回退到官方上游地址 ----
-    get_official_image_url "$system" "$ARCH_TYPE"
+    get_official_image_url "$en_system" "$num_system" "$ARCH_TYPE"
     if [[ -z "$CLOUD_IMG_URL" ]]; then
         _red "No upstream URL available for system: $system"
         exit 1
