@@ -607,6 +607,63 @@ check_ipv4() {
     IPV4=$(ip route get 8.8.8.8 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
 }
 
+# ======== 检查 libvirt default 网络是否就绪 ========
+# 网络的创建/定义由 qemuinstall.sh 负责，卸载由 qemuuninstall.sh 负责
+# 此处只负责：确认 libvirtd 在跑、网络已定义、网络已激活
+ensure_default_network() {
+    _yellow "Checking libvirt default NAT network..."
+
+    # 确保 libvirtd 正在运行
+    if ! virsh list >/dev/null 2>&1; then
+        _yellow "  libvirtd not responding, trying to start..."
+        systemctl start libvirtd 2>/dev/null || \
+            systemctl start libvirt-daemon 2>/dev/null || \
+            service libvirtd start 2>/dev/null || true
+        sleep 3
+        if ! virsh list >/dev/null 2>&1; then
+            _red "  libvirtd is not running. Please run qemuinstall.sh first."
+            exit 1
+        fi
+    fi
+
+    # 若 default 网络未定义，说明还没有执行过安装脚本
+    if ! virsh net-info default >/dev/null 2>&1; then
+        _red "  libvirt 'default' network is not defined."
+        _red "  Please run qemuinstall.sh first to set up the environment."
+        exit 1
+    fi
+
+    # 若 default 网络已定义但未激活，尝试启动（如宿主机重启后 autostart 未生效）
+    if ! virsh net-list 2>/dev/null | grep -q "default.*active"; then
+        _yellow "  default network is defined but not active, starting..."
+        virsh net-start default 2>/dev/null || true
+        sleep 2
+    fi
+
+    # 更新 bridge_name（以 libvirt 当前配置为准）
+    local detected_bridge
+    detected_bridge=$(virsh net-dumpxml default 2>/dev/null \
+        | grep '<bridge' \
+        | grep -oP 'name="\K[^"]+' \
+        || echo "virbr0")
+    bridge_name="$detected_bridge"
+    echo "$bridge_name" > /usr/local/bin/qemu_bridge
+
+    # 等待网桥接口出现在内核（net-start 后稍有延迟）
+    if ! ip link show "$bridge_name" >/dev/null 2>&1; then
+        _yellow "  Bridge $bridge_name not yet visible, waiting 3s..."
+        sleep 3
+    fi
+
+    if virsh net-list 2>/dev/null | grep -q "default.*active"; then
+        _green "  ✓ Default NAT network is active (bridge: $bridge_name)"
+    else
+        _red "  ✗ Failed to activate default NAT network."
+        _red "  Please re-run qemuinstall.sh to repair the environment."
+        exit 1
+    fi
+}
+
 # ======== 等待 VM 关机（cloud-init 第一次启动后执行 shutdown）========
 wait_for_shutdown() {
     local vm_name="$1"
@@ -635,6 +692,9 @@ wait_for_shutdown() {
 main() {
     _blue "Creating VM: name=${name} cpu=${cpu} memory=${memory}MB disk=${disk}GB system=${system}"
     _blue "SSH port: ${sshport}  port range: ${startport}-${endport}"
+
+    # 确保 libvirt 默认 NAT 网络就绪（virbr0 必须存在才能使用 virt-install）
+    ensure_default_network
 
     _blue "Base image: ${images_path}/${system}.qcow2"
 
@@ -687,7 +747,7 @@ main() {
         --import \
         --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
         --disk "path=${ci_iso},device=cdrom" \
-        --network "bridge=${bridge_name},mac=${vm_mac},model=virtio" \
+        --network "network=default,mac=${vm_mac},model=virtio" \
         --os-variant "$effective_os_variant" \
         --graphics none \
         --serial pty \
@@ -705,7 +765,7 @@ main() {
             --import \
             --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
             --disk "path=${ci_iso},device=cdrom" \
-            --network "bridge=${bridge_name},mac=${vm_mac},model=virtio" \
+            --network "network=default,mac=${vm_mac},model=virtio" \
             --os-variant detect=on,require=off \
             --graphics none \
             --serial pty \
