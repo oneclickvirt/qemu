@@ -431,7 +431,7 @@ allocate_ip() {
             return 0
         fi
     done
-    _red "No available IP in 192.168.122.0/24"
+    _red "No available IP in 192.168.122.0/24" >&2
     exit 1
 }
 
@@ -492,8 +492,8 @@ METAEOF
         mkisofs -output "$tmp_iso" -volid cidata -joliet -rock "$ci_dir" 2>/dev/null
         rm -rf "$ci_dir"
     else
-        _red "No ISO creation tool found (cloud-localds / genisoimage / mkisofs)"
-        _red "Please install: apt-get install cloud-image-utils"
+        _red "No ISO creation tool found (cloud-localds / genisoimage / mkisofs)" >&2
+        _red "Please install: apt-get install cloud-image-utils" >&2
         exit 1
     fi
 
@@ -740,14 +740,18 @@ main() {
 
     # 检测 os_info 是否在本机 osinfo 数据库中存在，不存在则用通用值
     local effective_os_variant="$os_info"
-    if ! virt-install --osinfo list 2>/dev/null | grep -qw "$os_info"; then
-        # 尝试通用年份标签（virt-install 4.0+）
-        for _generic in linux2024 linux2022 linux2020 linux2018 linux2016; do
-            if virt-install --osinfo list 2>/dev/null | grep -qw "$_generic"; then
-                effective_os_variant="$_generic"
-                break
-            fi
-        done
+    local osinfo_list
+    osinfo_list=$(virt-install --osinfo list 2>/dev/null || virt-install --os-variant list 2>/dev/null || true)
+    if [[ -n "$osinfo_list" ]]; then
+        if ! echo "$osinfo_list" | grep -qw "$os_info"; then
+            # 尝试通用年份标签（virt-install 4.0+）
+            for _generic in linux2024 linux2022 linux2020 linux2018 linux2016; do
+                if echo "$osinfo_list" | grep -qw "$_generic"; then
+                    effective_os_variant="$_generic"
+                    break
+                fi
+            done
+        fi
     fi
 
     virt-install \
