@@ -677,7 +677,7 @@ ensure_default_network() {
 wait_for_shutdown() {
     local vm_name="$1"
     _yellow "Waiting for VM first-boot setup to complete (cloud-init)..."
-    local max_wait=300  # 最多等待 5 分钟
+    local max_wait=600  # 最多等待 10 分钟（包含 apt安装耗时）
     local elapsed=0
     while true; do
         local state
@@ -689,7 +689,9 @@ wait_for_shutdown() {
         fi
         if (( elapsed >= max_wait )); then
             echo ""
-            _yellow "  ⚠ Timeout waiting for shutdown after ${max_wait}s, continuing anyway..."
+            _yellow "  ⚠ Timeout waiting for shutdown after ${max_wait}s, forcing VM off..."
+            virsh destroy "$vm_name" 2>/dev/null || true
+            sleep 3
             return 1
         fi
         sleep 5
@@ -799,6 +801,14 @@ main() {
 
     # 等待 VM 第一次启动完成（cloud-init 执行 shutdown）
     wait_for_shutdown "$name"
+    # 无论 cloud-init 是否正常关机，确保 VM 处于关机状态再继续
+    local cur_state
+    cur_state=$(virsh domstate "$name" 2>/dev/null || echo "unknown")
+    if [[ "$cur_state" != "shut off" ]]; then
+        _yellow "  VM still running, forcing shutdown..."
+        virsh destroy "$name" 2>/dev/null || true
+        sleep 3
+    fi
 
     # 在 libvirt default 网络中设置 DHCP 固定 IP
     _yellow "Setting DHCP reservation: $vm_mac -> $vm_ip"
@@ -826,12 +836,18 @@ main() {
 
     # 启动 VM
     _yellow "Starting VM: $name"
-    virsh start "$name"
-    if [[ $? -ne 0 ]]; then
-        _red "Failed to start VM $name"
-        exit 1
+    local vm_state
+    vm_state=$(virsh domstate "$name" 2>/dev/null || echo "unknown")
+    if [[ "$vm_state" == "running" ]]; then
+        _green "  ✓ VM ${name} is already running"
+    else
+        virsh start "$name"
+        if [[ $? -ne 0 ]]; then
+            _red "Failed to start VM $name"
+            exit 1
+        fi
+        _green "  ✓ VM ${name} started"
     fi
-    _green "  ✓ VM ${name} started"
 
     # 设置 VM 开机自启
     virsh autostart "$name" 2>/dev/null || true
