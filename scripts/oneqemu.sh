@@ -268,11 +268,21 @@ try_pve_kvm_images() {
     [[ -z "$selected" ]] && return 1
 
     _yellow "  Org image: ${selected}"
-    local url="${cdn_success_url}https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${selected}"
-    if wget -q --show-progress --connect-timeout=15 --timeout=600 \
+    local base_url="https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${selected}"
+    local url="${cdn_success_url}${base_url}"
+    # wget with redirect following
+    if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
             -O "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
         _green "  ✓ Downloaded from pve_kvm_images: ${selected}"
+        return 0
+    fi
+    rm -f "${img_path}.tmp" 2>/dev/null
+    # curl fallback (direct, no CDN)
+    if curl -fsSL --connect-timeout 30 --max-time 600 \
+            -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+        mv "${img_path}.tmp" "$img_path"
+        _green "  ✓ Downloaded from pve_kvm_images (curl): ${selected}"
         return 0
     fi
     rm -f "${img_path}.tmp" 2>/dev/null
@@ -286,11 +296,21 @@ try_kvm_images() {
     local img_path="$2"
 
     _yellow "Trying oneclickvirt/kvm_images for ${ver}..."
-    local url="${cdn_success_url}https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
-    if wget -q --show-progress --connect-timeout=15 --timeout=600 \
+    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
+    local url="${cdn_success_url}${base_url}"
+    # wget with redirect following
+    if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
             -O "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
         _green "  ✓ Downloaded from kvm_images: ${ver}.qcow2"
+        return 0
+    fi
+    rm -f "${img_path}.tmp" 2>/dev/null
+    # curl fallback (direct, no CDN)
+    if curl -fsSL --connect-timeout 30 --max-time 600 \
+            -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+        mv "${img_path}.tmp" "$img_path"
+        _green "  ✓ Downloaded from kvm_images (curl): ${ver}.qcow2"
         return 0
     fi
     rm -f "${img_path}.tmp" 2>/dev/null
@@ -665,14 +685,27 @@ main() {
         extra_args="--boot uefi=off"
     fi
 
+    # 检测 os_info 是否在本机 osinfo 数据库中存在，不存在则用通用值
+    local effective_os_variant="$os_info"
+    if ! virt-install --osinfo list 2>/dev/null | grep -qw "$os_info"; then
+        # 尝试通用年份标签（virt-install 4.0+）
+        for _generic in linux2024 linux2022 linux2020 linux2018 linux2016; do
+            if virt-install --osinfo list 2>/dev/null | grep -qw "$_generic"; then
+                effective_os_variant="$_generic"
+                break
+            fi
+        done
+    fi
+
     virt-install \
         --name "$name" \
         --memory "$memory" \
         --vcpus "$cpu" \
+        --import \
         --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
-        --disk "path=${ci_iso},device=cdrom,bus=scsi" \
+        --disk "path=${ci_iso},device=cdrom" \
         --network "bridge=${bridge_name},mac=${vm_mac},model=virtio" \
-        --os-variant "$os_info" \
+        --os-variant "$effective_os_variant" \
         --graphics none \
         --serial pty \
         --console pty,target_type=serial \
@@ -681,14 +714,16 @@ main() {
         2>/dev/null
 
     if [[ $? -ne 0 ]]; then
-        _red "virt-install failed! Trying without --os-variant..."
+        _red "virt-install failed! Trying with detect=on,require=off..."
         virt-install \
             --name "$name" \
             --memory "$memory" \
             --vcpus "$cpu" \
+            --import \
             --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
-            --disk "path=${ci_iso},device=cdrom,bus=scsi" \
+            --disk "path=${ci_iso},device=cdrom" \
             --network "bridge=${bridge_name},mac=${vm_mac},model=virtio" \
+            --os-variant detect=on,require=off \
             --graphics none \
             --serial pty \
             --console pty,target_type=serial \
