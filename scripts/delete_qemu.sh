@@ -63,13 +63,13 @@ fi
 _yellow "[2/5] 清理端口转发规则..."
 if [[ -f /etc/libvirt/hooks/qemu ]]; then
     # 提取 VM 的 iptables -I / -A 规则并执行相应的 -D（删除）
-    local in_block=false
+    in_block=false
     while IFS= read -r line; do
-        if echo "$line" | grep -q "#${vm_name}#"; then
+        if echo "$line" | grep -qE "^#${vm_name}#$"; then
             in_block=true
             continue
         fi
-        if echo "$line" | grep -q "###${vm_name}###"; then
+        if echo "$line" | grep -qE "^###${vm_name}###$"; then
             in_block=false
             continue
         fi
@@ -84,11 +84,11 @@ if [[ -f /etc/libvirt/hooks/qemu ]]; then
     tmpfile=$(mktemp)
     skip=false
     while IFS= read -r line; do
-        if echo "$line" | grep -q "^#${vm_name}#$"; then
+        if echo "$line" | grep -qE "^#${vm_name}#$"; then
             skip=true
             continue
         fi
-        if echo "$line" | grep -q "^###${vm_name}###$"; then
+        if echo "$line" | grep -qE "^###${vm_name}###$"; then
             skip=false
             continue
         fi
@@ -137,7 +137,6 @@ _green "  ✓ 虚拟机磁盘已删除"
 # ======== 5. 从日志中删除记录 ========
 _yellow "[5/5] 从日志中删除记录..."
 if [[ -f /root/vmlog ]]; then
-    local tmplog
     tmplog=$(mktemp)
     grep -v "^${vm_name} " /root/vmlog > "$tmplog" 2>/dev/null || true
     mv "$tmplog" /root/vmlog

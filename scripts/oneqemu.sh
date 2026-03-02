@@ -498,6 +498,11 @@ METAEOF
     fi
 
     rm -f "$tmp_yaml" "$meta_yaml"
+    # 验证 ISO 确实已生成
+    if [[ ! -s "$tmp_iso" ]]; then
+        echo "ERROR: cloud-init ISO was not created: $tmp_iso" >&2
+        exit 1
+    fi
     echo "$tmp_iso"
 }
 
@@ -510,7 +515,10 @@ create_disk() {
 
     _yellow "Creating VM disk: ${vm_disk} (${disk_gb}GB backing ${system}.qcow2)" >&2
     # 从 cloud image 创建差量磁盘（backing store）
-    qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$vm_disk" "${disk_gb}G" >&2
+    if ! qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$vm_disk" "${disk_gb}G" >&2; then
+        echo "ERROR: qemu-img create failed for $vm_disk" >&2
+        exit 1
+    fi
     echo "$vm_disk"
 }
 
@@ -527,7 +535,8 @@ configure_port_forwarding() {
 
     # 在 /etc/libvirt/hooks/qemu 中追加规则
     # 先添加标识符（用于删除）
-    if ! grep -q "#${vm_name}#" /etc/libvirt/hooks/qemu 2>/dev/null; then
+    # 使用行首匹配，避免 ###vm1### 结束标记被误匹
+    if ! grep -qE "^#${vm_name}#$" /etc/libvirt/hooks/qemu 2>/dev/null; then
         cat >> /etc/libvirt/hooks/qemu <<HOOKEOF
 
 #${vm_name}#
@@ -674,10 +683,12 @@ wait_for_shutdown() {
         local state
         state=$(virsh domstate "$vm_name" 2>/dev/null || echo "error")
         if [[ "$state" == "shut off" ]]; then
+            echo ""
             _green "  ✓ VM first-boot done, VM is shut down"
             return 0
         fi
         if (( elapsed >= max_wait )); then
+            echo ""
             _yellow "  ⚠ Timeout waiting for shutdown after ${max_wait}s, continuing anyway..."
             return 1
         fi
@@ -685,7 +696,6 @@ wait_for_shutdown() {
         (( elapsed += 5 ))
         echo -n "."
     done
-    echo ""
 }
 
 # ======== 主逻辑 ========
@@ -708,17 +718,17 @@ main() {
 
     # 分配静态 IP
     local vm_ip
-    vm_ip=$(allocate_ip)
+    vm_ip=$(allocate_ip) || { _red "Failed to allocate IP address"; exit 1; }
     _blue "VM IP: $vm_ip"
 
     # 创建 VM 磁盘
     local vm_disk
-    vm_disk=$(create_disk "$name" "$disk")
+    vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to create VM disk"; exit 1; }
 
     # 创建 cloud-init ISO
     _yellow "Creating cloud-init configuration..."
     local ci_iso
-    ci_iso=$(create_cloudinit "$name" "$passwd")
+    ci_iso=$(create_cloudinit "$name" "$passwd") || { _red "Failed to create cloud-init ISO"; exit 1; }
     _green "  ✓ cloud-init ISO: $ci_iso"
 
     # 部署虚拟机
@@ -803,6 +813,12 @@ main() {
     _yellow "Restarting libvirtd to apply hooks..."
     systemctl restart libvirtd 2>/dev/null || systemctl restart libvirt-daemon 2>/dev/null || true
     sleep 2
+    # libvirtd 重启后 default 网络可能短暂未激活，确保网络就绪后再启动 VM
+    if ! virsh net-list 2>/dev/null | grep -q "default.*active"; then
+        _yellow "  Restarting default network after libvirtd restart..."
+        virsh net-start default 2>/dev/null || true
+        sleep 2
+    fi
 
     # 启动 VM
     _yellow "Starting VM: $name"
