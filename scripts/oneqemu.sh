@@ -637,19 +637,12 @@ fi
 HOOKEOF3
     fi
 
-    # 立即应用 iptables 规则（无需重启 VM）
-    iptables -t nat -I PREROUTING -p tcp --dport "${ssh_port}" -j DNAT --to "${vm_ip}:22" 2>/dev/null || true
-    iptables -I FORWARD -o "${iface}" -p tcp -d "${vm_ip}" --dport 22 -j ACCEPT 2>/dev/null || true
-    iptables -t nat -I PREROUTING -p udp --dport "${ssh_port}" -j DNAT --to "${vm_ip}:22" 2>/dev/null || true
+    # 确保 NAT 出站和通用转发规则存在（libvirt default 网络 MASQUERADE，仅需一次）
     iptables -t nat -I POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || true
     iptables -I FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
     iptables -I FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
-    for ((port=start_p; port<=end_p; port++)); do
-        iptables -t nat -I PREROUTING -p tcp --dport "${port}" -j DNAT --to "${vm_ip}:${port}" 2>/dev/null || true
-        iptables -I FORWARD -o "${iface}" -p tcp -d "${vm_ip}" --dport "${port}" -j ACCEPT 2>/dev/null || true
-        iptables -t nat -I PREROUTING -p udp --dport "${port}" -j DNAT --to "${vm_ip}:${port}" 2>/dev/null || true
-        iptables -I FORWARD -o "${iface}" -p udp -d "${vm_ip}" --dport "${port}" -j ACCEPT 2>/dev/null || true
-    done
+    # 注意：per-VM 的 DNAT/FORWARD 端口规则不在此处立即写入，
+    # 统一由 /etc/libvirt/hooks/qemu 在 virsh start 时触发，避免重复。
 
     # 持久化保存
     netfilter-persistent save 2>/dev/null || \
