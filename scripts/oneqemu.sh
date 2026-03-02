@@ -244,48 +244,42 @@ get_org_image_ver() {
 }
 
 # 尝试从 oneclickvirt/pve_kvm_images 下载（最高优先级）
-# 该仓库由 CI 自动构建，镜像名形如 debian12-cloud-20240101.qcow2
+# 支持两种 release tag 格式：
+#   tag=images : .../releases/download/images/debian12.qcow2
+#   tag=<sys>  : .../releases/download/debian/debian12.qcow2
 try_pve_kvm_images() {
     local ver="$1"       # e.g. debian12
     local img_path="$2"  # 本地保存路径
+    local sys="$3"       # e.g. debian
 
     _yellow "Trying oneclickvirt/pve_kvm_images for ${ver}..."
-    local api_url="https://api.github.com/repos/oneclickvirt/pve_kvm_images/releases/tags/images"
-    local images_list=""
-    # GitHub API 直连（CDN 通常不代理 api.github.com）
-    images_list=$(curl -slk -m 15 "$api_url" 2>/dev/null | \
-        grep -o '"name":"[^"]*\.qcow2"' | sed 's/"name":"//;s/"//')
-    if [[ -z "$images_list" ]] && [[ -n "$cdn_success_url" ]]; then
-        images_list=$(curl -slk -m 15 "${cdn_success_url}${api_url}" 2>/dev/null | \
-            grep -o '"name":"[^"]*\.qcow2"' | sed 's/"name":"//;s/"//')
-    fi
-    [[ -z "$images_list" ]] && return 1
 
-    # 优先选择带 cloud 关键字的镜像，再按名称倒序取最新
-    local selected=""
-    selected=$(echo "$images_list" | grep "^${ver}" | sort -r | grep -i "cloud" | head -n1)
-    [[ -z "$selected" ]] && selected=$(echo "$images_list" | grep "^${ver}" | sort -r | head -n1)
-    [[ -z "$selected" ]] && return 1
+    # 直接按已知 URL 模式尝试，不依赖 GitHub API
+    local candidate_urls=(
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${ver}.qcow2"
+    )
 
-    _yellow "  Org image: ${selected}"
-    local base_url="https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${selected}"
-    local url="${cdn_success_url}${base_url}"
-    # wget with redirect following
-    if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
-            -O "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
-        mv "${img_path}.tmp" "$img_path"
-        _green "  ✓ Downloaded from pve_kvm_images: ${selected}"
-        return 0
-    fi
-    rm -f "${img_path}.tmp" 2>/dev/null
-    # curl fallback (direct, no CDN)
-    if curl -fsSL --connect-timeout 30 --max-time 600 \
-            -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
-        mv "${img_path}.tmp" "$img_path"
-        _green "  ✓ Downloaded from pve_kvm_images (curl): ${selected}"
-        return 0
-    fi
-    rm -f "${img_path}.tmp" 2>/dev/null
+    for base_url in "${candidate_urls[@]}"; do
+        _yellow "  Trying: ${base_url}"
+        # 优先走 CDN
+        local try_url="${cdn_success_url}${base_url}"
+        if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
+                -O "${img_path}.tmp" "$try_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+            mv "${img_path}.tmp" "$img_path"
+            _green "  ✓ Downloaded from pve_kvm_images: ${base_url##*/}"
+            return 0
+        fi
+        rm -f "${img_path}.tmp" 2>/dev/null
+        # curl 直连回退
+        if curl -fsSL --connect-timeout 30 --max-time 600 \
+                -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+            mv "${img_path}.tmp" "$img_path"
+            _green "  ✓ Downloaded from pve_kvm_images (curl): ${base_url##*/}"
+            return 0
+        fi
+        rm -f "${img_path}.tmp" 2>/dev/null
+    done
     return 1
 }
 
@@ -337,7 +331,7 @@ download_cloud_image() {
     local org_ver
     org_ver=$(get_org_image_ver "$system")
     if [[ -n "$org_ver" ]]; then
-        if try_pve_kvm_images "$org_ver" "$img_path"; then
+        if try_pve_kvm_images "$org_ver" "$img_path" "$system"; then
             return 0
         fi
         if try_kvm_images "$org_ver" "$img_path"; then
