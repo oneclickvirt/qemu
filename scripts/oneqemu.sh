@@ -264,18 +264,18 @@ try_pve_kvm_images() {
         _yellow "  Trying: ${base_url}"
         # 优先走 CDN
         local try_url="${cdn_success_url}${base_url}"
-        if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
-                -O "${img_path}.tmp" "$try_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+        if curl -fL --progress-bar --connect-timeout 30 --max-time 600 \
+                -o "${img_path}.tmp" "$try_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
             _green "  ✓ Downloaded from pve_kvm_images: ${base_url##*/}"
             return 0
         fi
         rm -f "${img_path}.tmp" 2>/dev/null
-        # curl 直连回退
+        # 直连回退
         if curl -fsSL --connect-timeout 30 --max-time 600 \
                 -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
-            _green "  ✓ Downloaded from pve_kvm_images (curl): ${base_url##*/}"
+            _green "  ✓ Downloaded from pve_kvm_images (direct): ${base_url##*/}"
             return 0
         fi
         rm -f "${img_path}.tmp" 2>/dev/null
@@ -292,19 +292,18 @@ try_kvm_images() {
     _yellow "Trying oneclickvirt/kvm_images for ${ver}..."
     local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
     local url="${cdn_success_url}${base_url}"
-    # wget with redirect following
-    if wget -q -L --show-progress --connect-timeout=30 --timeout=600 \
-            -O "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
+    if curl -fL --progress-bar --connect-timeout 30 --max-time 600 \
+            -o "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
         _green "  ✓ Downloaded from kvm_images: ${ver}.qcow2"
         return 0
     fi
     rm -f "${img_path}.tmp" 2>/dev/null
-    # curl fallback (direct, no CDN)
+    # 直连回退（无 CDN）
     if curl -fsSL --connect-timeout 30 --max-time 600 \
             -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
-        _green "  ✓ Downloaded from kvm_images (curl): ${ver}.qcow2"
+        _green "  ✓ Downloaded from kvm_images (direct): ${ver}.qcow2"
         return 0
     fi
     rm -f "${img_path}.tmp" 2>/dev/null
@@ -354,16 +353,12 @@ download_cloud_image() {
         local xz_path="${img_path}.xz"
         local dl_ok=false
         if [[ -n "$cdn_success_url" ]]; then
-            wget -q --show-progress --connect-timeout=15 --timeout=600 \
-                -O "$xz_path" "${cdn_success_url}${CLOUD_IMG_URL}" 2>/dev/null && \
+            curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
+                -o "$xz_path" "${cdn_success_url}${CLOUD_IMG_URL}" 2>/dev/null && \
                 [[ -s "$xz_path" ]] && dl_ok=true
         fi
         if [[ "$dl_ok" != true ]]; then
-            wget -q --show-progress --connect-timeout=15 --timeout=600 \
-                -O "$xz_path" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "$xz_path" ]] && dl_ok=true || true
-        fi
-        if [[ "$dl_ok" != true ]]; then
-            curl -L --connect-timeout 15 --max-time 600 \
+            curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
                 -o "$xz_path" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "$xz_path" ]] && dl_ok=true || true
         fi
         if [[ "$dl_ok" = true ]]; then
@@ -387,8 +382,8 @@ download_cloud_image() {
 
     # 普通镜像下载
     if [[ -n "$cdn_success_url" ]]; then
-        if wget -q --show-progress --connect-timeout=15 --timeout=600 \
-                -O "${img_path}.tmp" "${cdn_success_url}${CLOUD_IMG_URL}" 2>/dev/null && \
+        if curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
+                -o "${img_path}.tmp" "${cdn_success_url}${CLOUD_IMG_URL}" 2>/dev/null && \
                 [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
             _green "  ✓ Downloaded via CDN"
@@ -396,16 +391,10 @@ download_cloud_image() {
         fi
         rm -f "${img_path}.tmp" 2>/dev/null
     fi
-    if wget -q --show-progress --connect-timeout=15 --timeout=600 \
-            -O "${img_path}.tmp" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
-        mv "${img_path}.tmp" "$img_path"
-        _green "  ✓ Downloaded directly"
-        return 0
-    fi
-    if curl -L --connect-timeout 15 --max-time 600 --progress-bar \
+    if curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
             -o "${img_path}.tmp" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
-        _green "  ✓ Downloaded via curl"
+        _green "  ✓ Downloaded directly"
         return 0
     fi
     rm -f "${img_path}.tmp" 2>/dev/null
@@ -519,9 +508,9 @@ create_disk() {
     local base_img="${images_path}/${system}.qcow2"
     local vm_disk="${images_path}/vm-${vm_name}.qcow2"
 
-    _yellow "Creating VM disk: ${vm_disk} (${disk_gb}GB backing ${system}.qcow2)"
+    _yellow "Creating VM disk: ${vm_disk} (${disk_gb}GB backing ${system}.qcow2)" >&2
     # 从 cloud image 创建差量磁盘（backing store）
-    qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$vm_disk" "${disk_gb}G"
+    qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$vm_disk" "${disk_gb}G" >&2
     echo "$vm_disk"
 }
 

@@ -18,14 +18,14 @@
 ## 安装 QEMU/KVM 环境
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh)
 ```
 
 ## 开设单个虚拟机
 
 ```bash
 # 下载脚本
-wget -q https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/oneqemu.sh
+curl -sSL -o oneqemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/oneqemu.sh
 chmod +x oneqemu.sh
 
 # 用法:
@@ -52,7 +52,7 @@ chmod +x oneqemu.sh
 ## 批量开设虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/create_qemu.sh
+curl -sSL -o create_qemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/create_qemu.sh
 chmod +x create_qemu.sh
 ./create_qemu.sh
 ```
@@ -75,7 +75,7 @@ virsh domifaddr <name>              # 查看虚拟机 IP 地址
 ## 删除单个虚拟机
 
 ```bash
-wget -q https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/delete_qemu.sh
+curl -sSL -o delete_qemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/delete_qemu.sh
 chmod +x delete_qemu.sh
 ./delete_qemu.sh <vm_name>
 ```
@@ -87,7 +87,7 @@ chmod +x delete_qemu.sh
 一键卸载 QEMU/KVM 全套环境，包括所有虚拟机、磁盘镜像、网络配置、systemd 服务、软件包：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuuninstall.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuuninstall.sh)
 ```
 
 脚本会在执行前要求输入 `yes` 确认，操作不可逆。

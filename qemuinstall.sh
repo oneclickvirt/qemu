@@ -135,16 +135,16 @@ install_base_deps() {
     case $SYSTEM in
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute2 \
                 socat unzip tar jq dnsmasq-base genisoimage 2>/dev/null || true
             ;;
         CentOS|Fedora)
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute \
                 socat unzip tar jq dnsmasq genisoimage 2>/dev/null || true
             ;;
         Alpine)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute2 \
                 socat unzip tar jq cdrkit 2>/dev/null || true
             ;;
     esac
