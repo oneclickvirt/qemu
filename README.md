@@ -10,7 +10,7 @@
 
 - 使用 [QEMU/KVM](https://www.qemu.org/) + [libvirt](https://libvirt.org/) 安装完整虚拟化环境
 - 使用官方 Cloud Image（qcow2 格式），自动下载并使用 cloud-init 初始化
-- 支持系统：Debian 12、Ubuntu 24.04、AlmaLinux 9、RockyLinux 9、OpenEuler 22.03
+- 支持系统：Debian 10/11/12/13、Ubuntu 18/20/22/24、AlmaLinux 8/9、RockyLinux 8/9、OpenEuler 22
 - 支持架构：amd64、arm64
 - 网络模式：libvirt NAT（virbr0），通过 iptables 进行端口映射
 - 虚拟机信息记录在 `/root/vmlog`
@@ -28,11 +28,14 @@ bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuin
 curl -sSL -o oneqemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/oneqemu.sh
 chmod +x oneqemu.sh
 
-# 用法:
+# 用法 (两种格式均支持):
 # ./oneqemu.sh <name> <cpu> <memory_mb> <disk_gb> <password> <sshport> <startport> <endport> [system]
+# ./oneqemu.sh <name> <cpu> <memory_mb> <disk_gb> <password> <sshport> <startport> <endport> <extra_flag(y/n)> [system]
 
 # 示例: 创建名为 vm1 的 Debian 虚拟机，1核 1024MB 20GB，SSH端口25001，额外端口35001-35025
 ./oneqemu.sh vm1 1 1024 20 MyPassword 25001 35001 35025 debian
+# 示例: 第 9 个参数为附加标志（y/n），第 10 个参数为系统名
+./oneqemu.sh vm1 1 1024 10 MyPassword 25000 34975 35000 n debian13
 ```
 
 | 参数 | 说明 | 默认值 |
@@ -45,9 +48,19 @@ chmod +x oneqemu.sh
 | sshport | 宿主机 SSH 映射端口 | 25001 |
 | startport | 额外端口范围起始 | 35001 |
 | endport | 额外端口范围结束 | 35025 |
-| system | 系统类型 | debian |
+| system | 系统类型（第 9 或第 10 个参数） | debian |
 
-**支持的 system 值：** `debian` `ubuntu` `almalinux` `rockylinux` `openeuler`
+**支持的 system 值：**
+
+| 系统名 | 支持版本号 | 示例 |
+|--------|-----------|------|
+| `debian` | 10 11 12 13 | `debian` `debian12` `debian13` |
+| `ubuntu` | 18 20 22 24 | `ubuntu` `ubuntu22` `ubuntu24` |
+| `almalinux` | 8 9 | `almalinux9`（`alma9` 亦可） |
+| `rockylinux` | 8 9 | `rockylinux9`（`rocky9` 亦可） |
+| `openeuler` | 22 | `openeuler` |
+
+> system 名称不区分大小写，支持带 `-` 或 `_` 分隔符（如 `debian-13`、`ubuntu_22`），均可自动规范化。
 
 ## 批量开设虚拟机
 
@@ -98,11 +111,11 @@ bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuun
 
 | 系统 | 镜像来源 |
 |------|---------|
-| Debian 12 | cloud.debian.org |
-| Ubuntu 24.04 | cloud-images.ubuntu.com |
-| AlmaLinux 9 | repo.almalinux.org |
-| RockyLinux 9 | dl.rockylinux.org |
-| OpenEuler 22.03 | repo.openeuler.org |
+| Debian 10/11/12/13 | cloud.debian.org |
+| Ubuntu 18/20/22/24 | cloud-images.ubuntu.com |
+| AlmaLinux 8/9 | repo.almalinux.org |
+| RockyLinux 8/9 | dl.rockylinux.org |
+| OpenEuler 22 | repo.openeuler.org |
 
 ## 网络说明
 

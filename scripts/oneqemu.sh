@@ -5,8 +5,10 @@
 
 # Usage:
 # ./oneqemu.sh <name> <cpu> <memory_mb> <disk_gb> <password> <sshport> <startport> <endport> [system]
+# ./oneqemu.sh <name> <cpu> <memory_mb> <disk_gb> <password> <sshport> <startport> <endport> <extra_flag(y/n)> [system]
 # Example:
 # ./oneqemu.sh vm1 1 1024 20 MyPassword 25001 35001 35025 debian
+# ./oneqemu.sh vm1 1 1024 20 MyPassword 25001 35001 35025 n debian13
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -28,7 +30,17 @@ passwd="${5:-123456}"
 sshport="${6:-25001}"
 startport="${7:-35001}"
 endport="${8:-35025}"
-system="${9:-debian}"
+# $9 可能为附加标志（如 y/n），$10 可能才是系统名
+# 若 $9 非空且不像 y/n/yes/no 这类纯标志，则作为系统名；否则取 $10
+_raw9="${9:-}"
+_raw10="${10:-}"
+if [[ -n "$_raw10" && ("$_raw9" == "y" || "$_raw9" == "n" || "$_raw9" == "yes" || "$_raw9" == "no") ]]; then
+    system="$_raw10"
+elif [[ -n "$_raw9" ]]; then
+    system="$_raw9"
+else
+    system="debian"
+fi
 
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
@@ -167,7 +179,8 @@ case "$system" in
 esac
 
 # 去掉分隔符（ubuntu-22→ubuntu22，ubuntu_22→ubuntu22）
-system=$(echo "$system" | tr -d '-_')
+# 注意：tr -d '-_' 中 - 开头会被误判为选项，需将 - 置于末尾
+system=$(echo "$system" | tr -d '_-')
 
 # 4 位 Ubuntu 版本号缩短（ubuntu2204→ubuntu22，ubuntu2404→ubuntu24）
 system=$(echo "$system" | sed 's/^\(ubuntu\)\([0-9][0-9]\)[0-9][0-9]$/\1\2/')
