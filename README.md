@@ -72,6 +72,11 @@ chmod +x create_qemu.sh
 
 交互式脚本，自动递增虚拟机名（vm1, vm2, ...）、SSH 端口、公网端口，虚拟机信息记录到 `vmlog` 文件。
 
+> **说明：** 脚本不会阻塞等待 cloud-init 完成。DHCP 预留和端口转发规则在 VM 启动前已配置完毕，cloud-init 在后台运行；初始化完成（密码设置、SSH 配置等）后 VM 自动关机并重启。可通过以下命令查看初始化进度：
+> ```bash
+> tail -f /tmp/qemu-init-<vm_name>.log
+> ```
+
 ## 查看与管理虚拟机
 
 ```bash

@@ -739,31 +739,39 @@ ensure_default_network() {
     fi
 }
 
-# ======== 等待 VM 关机（cloud-init 第一次启动后执行 shutdown）========
-wait_for_shutdown() {
+# ======== 后台守护：cloud-init 首次关机后自动重启 VM ========
+# 参考 bashvm 的处理方式：不阻塞主脚本，由后台进程完成"等待关机→重启"
+# 日志写入 /tmp/qemu-init-<name>.log，方便排查
+spawn_restart_daemon() {
     local vm_name="$1"
-    _yellow "Waiting for VM first-boot setup to complete (cloud-init)..."
-    local max_wait=600  # 最多等待 10 分钟（包含 apt安装耗时）
-    local elapsed=0
-    while true; do
-        local state
-        state=$(virsh domstate "$vm_name" 2>/dev/null || echo "error")
-        if [[ "$state" == "shut off" ]]; then
-            echo ""
-            _green "  ✓ VM first-boot done, VM is shut down"
-            return 0
-        fi
-        if (( elapsed >= max_wait )); then
-            echo ""
-            _yellow "  ⚠ Timeout waiting for shutdown after ${max_wait}s, forcing VM off..."
-            virsh destroy "$vm_name" 2>/dev/null || true
-            sleep 3
-            return 1
-        fi
-        sleep 5
-        (( elapsed += 5 ))
-        echo -n "."
-    done
+    local log_file="/tmp/qemu-init-${vm_name}.log"
+    # 使用 nohup + 独立子 shell，主脚本退出后仍继续运行
+    nohup bash -c "
+        echo \"[\$(date)] Waiting for cloud-init firstboot shutdown of ${vm_name}...\" >> \"${log_file}\"
+        max_wait=600   # 最多等 10 分钟（包含 apt 安装耗时）
+        elapsed=0
+        while true; do
+            state=\$(virsh domstate '${vm_name}' 2>/dev/null || echo 'error')
+            if [[ \"\$state\" == 'shut off' ]]; then
+                echo \"[\$(date)] VM ${vm_name} has shut off (cloud-init done). Starting...\" >> \"${log_file}\"
+                virsh start '${vm_name}' >> \"${log_file}\" 2>&1
+                echo \"[\$(date)] Done.\" >> \"${log_file}\"
+                exit 0
+            fi
+            if (( elapsed >= max_wait )); then
+                echo \"[\$(date)] Timeout \${max_wait}s waiting for shutdown. Forcing off then starting...\" >> \"${log_file}\"
+                virsh destroy '${vm_name}' >> \"${log_file}\" 2>&1 || true
+                sleep 3
+                virsh start  '${vm_name}' >> \"${log_file}\" 2>&1
+                exit 1
+            fi
+            sleep 5
+            (( elapsed += 5 ))
+        done
+    " >> "$log_file" 2>&1 &
+    disown
+    _yellow "  Cloud-init running in background. VM will auto-restart when done."
+    _yellow "  Progress: tail -f ${log_file}"
 }
 
 # ======== 主逻辑 ========
@@ -799,7 +807,33 @@ main() {
     ci_iso=$(create_cloudinit "$name" "$passwd") || { _red "Failed to create cloud-init ISO"; exit 1; }
     _green "  ✓ cloud-init ISO: $ci_iso"
 
-    # 部署虚拟机
+    # ── 先配置好网络/钩子，再启动 VM（参考 bashvm 的做法）──────────────
+
+    # 在 libvirt default 网络中设置 DHCP 固定 IP（MAC 已知，无需等待首次启动）
+    _yellow "Setting DHCP reservation: $vm_mac -> $vm_ip"
+    virsh net-update default add ip-dhcp-host \
+        "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
+        --live --config 2>/dev/null || \
+    virsh net-update default add ip-dhcp-host \
+        "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
+        --config 2>/dev/null || true
+    _green "  ✓ DHCP reservation: $vm_mac -> $vm_ip"
+
+    # 配置端口转发（写入 /etc/libvirt/hooks/qemu）
+    configure_port_forwarding "$name" "$vm_ip" "$sshport" "$startport" "$endport"
+
+    # 重启 libvirtd 使 hooks 生效，再确认网络就绪
+    _yellow "Restarting libvirtd to apply hooks..."
+    systemctl restart libvirtd 2>/dev/null || systemctl restart libvirt-daemon 2>/dev/null || true
+    sleep 2
+    if ! virsh net-list 2>/dev/null | grep -q "default.*active"; then
+        _yellow "  Restarting default network after libvirtd restart..."
+        virsh net-start default 2>/dev/null || true
+        sleep 2
+    fi
+
+    # ── 部署虚拟机 ──────────────────────────────────────────────────────
+
     _yellow "Deploying VM with virt-install..."
     local extra_args=""
     if [[ "$ARCH_TYPE" == "aarch64" || "$ARCH_TYPE" == "arm64" ]]; then
@@ -812,7 +846,6 @@ main() {
     osinfo_list=$(virt-install --osinfo list 2>/dev/null || virt-install --os-variant list 2>/dev/null || true)
     if [[ -n "$osinfo_list" ]]; then
         if ! echo "$osinfo_list" | grep -qw "$os_info"; then
-            # 尝试通用年份标签（virt-install 4.0+）
             for _generic in linux2024 linux2022 linux2020 linux2018 linux2016; do
                 if echo "$osinfo_list" | grep -qw "$_generic"; then
                     effective_os_variant="$_generic"
@@ -856,7 +889,6 @@ main() {
             $extra_args
         if [[ $? -ne 0 ]]; then
             _red "VM deployment failed"
-            # 清理
             virsh undefine "$name" 2>/dev/null || true
             rm -f "$vm_disk" "$ci_iso" 2>/dev/null || true
             exit 1
@@ -865,63 +897,16 @@ main() {
 
     _green "  ✓ VM created: $name"
 
-    # 等待 VM 第一次启动完成（cloud-init 执行 shutdown）
-    wait_for_shutdown "$name"
-    # 无论 cloud-init 是否正常关机，确保 VM 处于关机状态再继续
-    local cur_state
-    cur_state=$(virsh domstate "$name" 2>/dev/null || echo "unknown")
-    if [[ "$cur_state" != "shut off" ]]; then
-        _yellow "  VM still running, forcing shutdown..."
-        virsh destroy "$name" 2>/dev/null || true
-        sleep 3
-    fi
-
-    # 在 libvirt default 网络中设置 DHCP 固定 IP
-    _yellow "Setting DHCP reservation: $vm_mac -> $vm_ip"
-    virsh net-update default add ip-dhcp-host \
-        "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
-        --live --config 2>/dev/null || \
-    virsh net-update default add ip-dhcp-host \
-        "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
-        --config 2>/dev/null || true
-    _green "  ✓ DHCP reservation: $vm_mac -> $vm_ip"
-
-    # 配置端口转发
-    configure_port_forwarding "$name" "$vm_ip" "$sshport" "$startport" "$endport"
-
-    # 重新启动 libvirtd，使 hooks 生效
-    _yellow "Restarting libvirtd to apply hooks..."
-    systemctl restart libvirtd 2>/dev/null || systemctl restart libvirt-daemon 2>/dev/null || true
-    sleep 2
-    # libvirtd 重启后 default 网络可能短暂未激活，确保网络就绪后再启动 VM
-    if ! virsh net-list 2>/dev/null | grep -q "default.*active"; then
-        _yellow "  Restarting default network after libvirtd restart..."
-        virsh net-start default 2>/dev/null || true
-        sleep 2
-    fi
-
-    # 启动 VM
-    _yellow "Starting VM: $name"
-    local vm_state
-    vm_state=$(virsh domstate "$name" 2>/dev/null || echo "unknown")
-    if [[ "$vm_state" == "running" ]]; then
-        _green "  ✓ VM ${name} is already running"
-    else
-        virsh start "$name"
-        if [[ $? -ne 0 ]]; then
-            _red "Failed to start VM $name"
-            exit 1
-        fi
-        _green "  ✓ VM ${name} started"
-    fi
-
-    # 设置 VM 开机自启
+    # 设置 VM 开机自启（cloud-init 完成后的正常启动也走 autostart 路径）
     virsh autostart "$name" 2>/dev/null || true
+
+    # ── 不阻塞等待 cloud-init——后台守护进程负责重启 VM ──────────────────
+    # cloud-init runcmd 最后执行 shutdown -P now，VM 关机后后台进程自动 virsh start
+    spawn_restart_daemon "$name"
 
     # 检测公网 IP
     check_ipv4
 
-    # 获取公网 IP
     echo ""
     _green "======================================================"
     _green "  ✓ VM ${name} 创建成功！"
@@ -939,6 +924,8 @@ main() {
     fi
     _green "  密码:     ${passwd}"
     _green "  端口映射: ${startport}-${endport} → ${startport}-${endport} (NAT)"
+    _green "  初始化:   cloud-init 正在后台运行，完成后 VM 将自动重启"
+    _green "  进度查看: tail -f /tmp/qemu-init-${name}.log"
     _green "======================================================"
 
     # 记录到日志文件
