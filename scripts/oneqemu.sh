@@ -530,13 +530,12 @@ write_files:
       PermitRootLogin yes
       PasswordAuthentication yes
       PubkeyAuthentication yes
-packages:
-  - qemu-guest-agent
 runcmd:
+  - systemctl enable --now serial-getty@ttyS0.service 2>/dev/null || true
+  - systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent 2>/dev/null || true
   - systemctl enable qemu-guest-agent 2>/dev/null || true
   - systemctl start qemu-guest-agent 2>/dev/null || true
-  - systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  - systemctl enable --now serial-getty@ttyS0.service 2>/dev/null || true
   - shutdown -P now
 CIEOF
 
@@ -748,7 +747,7 @@ spawn_restart_daemon() {
     # 使用 nohup + 独立子 shell，主脚本退出后仍继续运行
     nohup bash -c "
         echo \"[\$(date)] Waiting for cloud-init firstboot shutdown of ${vm_name}...\" >> \"${log_file}\"
-        max_wait=600   # 最多等 10 分钟（包含 apt 安装耗时）
+        max_wait=1800  # 最多等 30 分钟（包含 apt 安装耗时，Debian 13 可能较慢）
         elapsed=0
         while true; do
             state=\$(virsh domstate '${vm_name}' 2>/dev/null || echo 'error')
