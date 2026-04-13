@@ -94,7 +94,13 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -D FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    # Save cleaned rules (both v4 and v6)
+    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    service iptables save 2>/dev/null || true
+    service ip6tables save 2>/dev/null || true
+    netfilter-persistent save 2>/dev/null || true
 fi
 _green "  防火墙规则已清理"
 

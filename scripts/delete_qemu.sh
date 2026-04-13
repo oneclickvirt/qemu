@@ -118,7 +118,13 @@ elif [[ "$FW_BACKEND" == "iptables" ]]; then
         done
     fi
     _green "  ✓ iptables 规则已清理"
+    # Save both IPv4 and IPv6 rules
+    mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    service iptables save 2>/dev/null || true
+    service ip6tables save 2>/dev/null || true
+    netfilter-persistent save 2>/dev/null || true
 fi
 
 # 清理 hooks 文件中该 VM 的条目（如有遗留）

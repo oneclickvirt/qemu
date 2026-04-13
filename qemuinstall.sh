@@ -323,6 +323,7 @@ configure_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         echo "iptables" > /usr/local/bin/qemu_fw_backend
         _green "  Using iptables backend (nft not available)"
+        # IPv4 base rules
         iptables -t nat -C POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || \
             iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
         iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
@@ -331,15 +332,27 @@ configure_firewall() {
             iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
             iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
-        # Install iptables-persistent for Debian/Ubuntu
+        
+        # Install persistence tools
         if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
             echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
             echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent 2>/dev/null || true
+            systemctl enable netfilter-persistent 2>/dev/null || true
+        elif [[ "$SYSTEM" == "CentOS" || "$SYSTEM" == "Fedora" ]]; then
+            ${PACKAGE_INSTALL[int]} iptables-services 2>/dev/null || true
+            systemctl enable iptables 2>/dev/null || true
+            systemctl enable ip6tables 2>/dev/null || true
         fi
+        
+        # Save rules (both v4 and v6)
         mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        _green "  ✓ iptables base rules configured"
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        # Also save for CentOS/Fedora
+        service iptables save 2>/dev/null || true
+        service ip6tables save 2>/dev/null || true
+        _green "  ✓ iptables base rules configured and persisted"
     else
         _red "No firewall tool available (nft or iptables)"
         exit 1

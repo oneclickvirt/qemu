@@ -705,7 +705,15 @@ fw_save() {
             nft list table ip qemu
         } > /etc/nftables.d/qemu.nft 2>/dev/null || true
     else
+        # Save both IPv4 and IPv6 rules
+        mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        # Also save for CentOS/Fedora iptables-services
+        service iptables save 2>/dev/null || true
+        service ip6tables save 2>/dev/null || true
+        # Trigger netfilter-persistent save (Debian/Ubuntu)
+        netfilter-persistent save 2>/dev/null || true
     fi
 }
 
