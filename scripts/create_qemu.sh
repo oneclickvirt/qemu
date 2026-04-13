@@ -4,7 +4,10 @@
 # 2026.03.02
 
 # 批量开设 QEMU/KVM 虚拟机脚本
-# 交互式创建多个 Linux 虚拟机，记录到 vmlog 日志文件
+# 交互式或命令行创建多个 Linux 虚拟机，记录到 vmlog 日志文件
+# 非交互用法：
+#   ./create_qemu.sh <数量> <内存MB> <CPU> <磁盘GB> <系统类型>
+#   例: ./create_qemu.sh 3 1024 1 20 debian12
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -106,34 +109,57 @@ check_log() {
 
 # ======== 构建新虚拟机 ========
 build_new_vms() {
-    # 询问数量
-    reading "需要新增几个虚拟机？ (How many VMs to create?) [default: 1]: " new_nums
-    [[ -z "$new_nums" || ! "$new_nums" =~ ^[0-9]+$ ]] && new_nums=1
+    # 支持命令行参数的非交互模式
+    # $1=数量 $2=内存MB $3=CPU $4=磁盘GB $5=系统类型
+    local cli_nums="${1:-}"
+    local cli_memory="${2:-}"
+    local cli_cpu="${3:-}"
+    local cli_disk="${4:-}"
+    local cli_system="${5:-}"
 
-    # 询问内存大小
-    reading "每个虚拟机内存大小(MB) (Memory per VM in MB) [default: 1024]: " memory_nums
-    [[ -z "$memory_nums" || ! "$memory_nums" =~ ^[0-9]+$ ]] && memory_nums=1024
+    if [[ -n "$cli_nums" && "$cli_nums" =~ ^[0-9]+$ ]]; then
+        new_nums="$cli_nums"
+    else
+        reading "需要新增几个虚拟机？ (How many VMs to create?) [default: 1]: " new_nums
+        [[ -z "$new_nums" || ! "$new_nums" =~ ^[0-9]+$ ]] && new_nums=1
+    fi
 
-    # 询问 CPU
-    reading "每个虚拟机 CPU 核数 (CPU cores per VM) [default: 1]: " cpu_nums
-    [[ -z "$cpu_nums" || ! "$cpu_nums" =~ ^[0-9]+$ ]] && cpu_nums=1
+    if [[ -n "$cli_memory" && "$cli_memory" =~ ^[0-9]+$ ]]; then
+        memory_nums="$cli_memory"
+    else
+        reading "每个虚拟机内存大小(MB) (Memory per VM in MB) [default: 1024]: " memory_nums
+        [[ -z "$memory_nums" || ! "$memory_nums" =~ ^[0-9]+$ ]] && memory_nums=1024
+    fi
 
-    # 询问磁盘大小
-    reading "每个虚拟机磁盘大小(GB) (Disk size per VM in GB) [default: 20]: " disk_nums
-    [[ -z "$disk_nums" || ! "$disk_nums" =~ ^[0-9]+$ ]] && disk_nums=20
+    if [[ -n "$cli_cpu" && "$cli_cpu" =~ ^[0-9]+$ ]]; then
+        cpu_nums="$cli_cpu"
+    else
+        reading "每个虚拟机 CPU 核数 (CPU cores per VM) [default: 1]: " cpu_nums
+        [[ -z "$cpu_nums" || ! "$cpu_nums" =~ ^[0-9]+$ ]] && cpu_nums=1
+    fi
 
-    # 询问系统
-    _blue "支持的系统 / Supported systems:"
-    _blue "  1. debian12 (default)  2. ubuntu22"
-    _blue "  3. almalinux9          4. rockylinux9"
-    _blue "  5. openeuler"
-    _blue "  可指定版本 / Version examples:"
-    _blue "    debian: debian10 debian11 debian12 debian13"
-    _blue "    ubuntu: ubuntu18 ubuntu20 ubuntu22 ubuntu24"
-    _blue "    almalinux: almalinux8 almalinux9"
-    _blue "    rockylinux: rockylinux8 rockylinux9"
-    reading "系统类型 (system type) [default: debian12]: " system_type
-    [[ -z "$system_type" ]] && system_type="debian12"
+    if [[ -n "$cli_disk" && "$cli_disk" =~ ^[0-9]+$ ]]; then
+        disk_nums="$cli_disk"
+    else
+        reading "每个虚拟机磁盘大小(GB) (Disk size per VM in GB) [default: 20]: " disk_nums
+        [[ -z "$disk_nums" || ! "$disk_nums" =~ ^[0-9]+$ ]] && disk_nums=20
+    fi
+
+    if [[ -n "$cli_system" ]]; then
+        system_type="$cli_system"
+    else
+        _blue "支持的系统 / Supported systems:"
+        _blue "  1. debian12 (default)  2. ubuntu22"
+        _blue "  3. almalinux9          4. rockylinux9"
+        _blue "  5. openeuler"
+        _blue "  可指定版本 / Version examples:"
+        _blue "    debian: debian10 debian11 debian12 debian13"
+        _blue "    ubuntu: ubuntu18 ubuntu20 ubuntu22 ubuntu24"
+        _blue "    almalinux: almalinux8 almalinux9"
+        _blue "    rockylinux: rockylinux8 rockylinux9"
+        reading "系统类型 (system type) [default: debian12]: " system_type
+        [[ -z "$system_type" ]] && system_type="debian12"
+    fi
     system_type=$(echo "$system_type" | tr '[:upper:]' '[:lower:]')
     # 支持数字选择
     case "$system_type" in
@@ -229,7 +255,7 @@ main() {
     pre_check
     check_log
     show_log
-    build_new_vms
+    build_new_vms "$@"
     check_log
     show_log
 }

@@ -157,14 +157,16 @@ install_qemu_stack() {
     case $SYSTEM in
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            # 预设 iptables-persistent 安装应答，避免交互提示
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} \
                 qemu-kvm \
+                qemu-system \
                 libvirt-daemon-system \
                 libvirt-clients \
-                virt-manager \
                 virtinst \
                 qemu-utils \
-                cloud-init \
                 cloud-image-utils \
                 bridge-utils \
                 net-tools \
@@ -401,7 +403,17 @@ main() {
         fi
     done
 
-    reading "虚拟机镜像存储路径？（回车默认：/var/lib/libvirt/images）：" qemu_images_path
+    # 非交互模式：如果 stdin 不是终端（如 curl | bash），使用默认值
+    # 也支持命令行参数：./qemuinstall.sh /path/to/images
+    local cli_images_path="${1:-}"
+    if [[ -n "$cli_images_path" ]]; then
+        qemu_images_path="$cli_images_path"
+    elif [[ -t 0 ]]; then
+        reading "虚拟机镜像存储路径？（回车默认：/var/lib/libvirt/images）：" qemu_images_path
+    else
+        _yellow "Non-interactive mode detected, using default images path"
+        qemu_images_path=""
+    fi
     if [ -z "$qemu_images_path" ]; then
         qemu_images_path="/var/lib/libvirt/images"
     fi

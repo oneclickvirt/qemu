@@ -14,6 +14,14 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+# 支持 -y / --force / --yes 跳过确认
+force_mode=false
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes|--force) force_mode=true ;;
+    esac
+done
+
 echo ""
 echo "======================================================"
 _red "  ⚠  警告：即将卸载 QEMU/KVM 全套环境"
@@ -23,16 +31,20 @@ echo "  以及相关软件包。"
 _red "  此操作不可逆！"
 echo "======================================================"
 echo ""
-echo "请输入 yes 确认（其他输入取消）："
-read -rp "> " confirm
-if [[ "$confirm" != "yes" ]]; then
-    _yellow "已取消卸载"
-    exit 0
+if [[ "$force_mode" != true ]]; then
+    echo "请输入 yes 确认（其他输入取消）："
+    read -rp "> " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        _yellow "已取消卸载"
+        exit 0
+    fi
 fi
 echo ""
 
 # ======== 1. 关闭并删除所有虚拟机 ========
 _blue "[1/9] 关闭并删除所有虚拟机..."
+# 杀掉后台 cloud-init 守护进程
+pkill -f "qemu-init-" 2>/dev/null || true
 if command -v virsh >/dev/null 2>&1; then
     # 强制关闭所有运行中的VM
     virsh list --name 2>/dev/null | while read -r vm; do
@@ -57,9 +69,11 @@ fi
 _blue "[2/9] 清理 iptables 端口转发规则..."
 # 删除 libvirt hooks 中的所有自定义规则
 if [[ -f /etc/libvirt/hooks/qemu ]]; then
-    # 读取 hooks 中的 iptables -D 规则并执行（清理规则）
-    grep 'iptables.*-D\|iptables.*-I\|iptables.*-A' /etc/libvirt/hooks/qemu 2>/dev/null | \
-        sed 's/-I /-D /g; s/-A /-D /g' | bash 2>/dev/null || true
+    # 提取 hooks 中的 iptables -I / -A 规则（不含 -D 规则），转为 -D 并执行
+    grep -E 'iptables\s+(-t\s+\S+\s+)?-[IA]\s' /etc/libvirt/hooks/qemu 2>/dev/null | \
+        sed 's/-I /-D /g; s/-A /-D /g' | while IFS= read -r line; do
+        eval "$line" 2>/dev/null || true
+    done
 fi
 # 额外清理 QEMU NAT 相关规则
 iptables -t nat -F PREROUTING 2>/dev/null || true
@@ -120,8 +134,8 @@ done
 case $SYSTEM in
     Debian|Ubuntu)
         apt-get remove -y --purge \
-            qemu-kvm libvirt-daemon-system libvirt-clients virt-manager virtinst \
-            qemu-utils cloud-init cloud-image-utils bridge-utils \
+            qemu-kvm qemu-system libvirt-daemon-system libvirt-clients virtinst \
+            qemu-utils cloud-image-utils bridge-utils \
             iptables-persistent netfilter-persistent 2>/dev/null || true
         apt-get autoremove -y 2>/dev/null || true
         ;;
@@ -180,6 +194,8 @@ for f in \
 done
 # 删除 /tmp 残留
 rm -f /tmp/qemu-cloudinit*.yaml /tmp/qemu-cloudinit*.iso 2>/dev/null || true
+rm -f /tmp/qemu-init-*.log 2>/dev/null || true
+rm -f /tmp/qemu-ci-* 2>/dev/null || true
 _green "  状态文件已清理"
 
 # ======== 9. 清理 sysctl 配置 ========

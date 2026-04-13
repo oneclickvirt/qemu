@@ -532,8 +532,13 @@ write_files:
       PubkeyAuthentication yes
 runcmd:
   - systemctl enable --now serial-getty@ttyS0.service 2>/dev/null || true
+  - |
+    if [ -f /etc/ssh/sshd_config ]; then
+      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    fi
   - systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent 2>/dev/null || true
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent 2>/dev/null || yum install -y qemu-guest-agent 2>/dev/null || dnf install -y qemu-guest-agent 2>/dev/null || true
   - systemctl enable qemu-guest-agent 2>/dev/null || true
   - systemctl start qemu-guest-agent 2>/dev/null || true
   - shutdown -P now
@@ -617,8 +622,8 @@ if [ "\${1}" = "${vm_name}" ]; then
         /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
         /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
         /sbin/iptables -t nat -D PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
+        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
 HOOKEOF
-        # 输出各端口的删除规则
         for ((port=start_p; port<=end_p; port++)); do
             cat >> /etc/libvirt/hooks/qemu <<PORTEOF
         /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
@@ -630,12 +635,23 @@ PORTEOF
         cat >> /etc/libvirt/hooks/qemu <<HOOKEOF2
     fi
     if [ "\${2}" = "start" ] || [ "\${2}" = "reconnect" ]; then
+        # 先删除已有规则防止重复（幂等操作）
+        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
+        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
+        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
+        # 添加规则
         /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22
         /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT
         /sbin/iptables -t nat -I PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22
+        /sbin/iptables -I FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT
 HOOKEOF2
         for ((port=start_p; port<=end_p; port++)); do
             cat >> /etc/libvirt/hooks/qemu <<PORTEOF2
+        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
+        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
+        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
         /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port}
         /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT
         /sbin/iptables -t nat -I PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port}
@@ -650,11 +666,27 @@ HOOKEOF3
     fi
 
     # 确保 NAT 出站和通用转发规则存在（libvirt default 网络 MASQUERADE，仅需一次）
-    iptables -t nat -I POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || true
-    iptables -I FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
-    iptables -I FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
-    # 注意：per-VM 的 DNAT/FORWARD 端口规则不在此处立即写入，
-    # 统一由 /etc/libvirt/hooks/qemu 在 virsh start 时触发，避免重复。
+    iptables -t nat -C POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -I POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || true
+    iptables -C FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
+
+    # 立即应用 per-VM 的 DNAT/FORWARD 端口规则（确保首次创建即可用，不等到 VM lifecycle hook）
+    _yellow "Applying iptables rules immediately for ${vm_name}..."
+    /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
+    /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
+    /sbin/iptables -t nat -I PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
+    for ((port=start_p; port<=end_p; port++)); do
+        /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
+        /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
+        /sbin/iptables -t nat -I PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
+        /sbin/iptables -I FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
+    done
+    _green "  ✓ iptables rules applied immediately"
 
     # 持久化保存
     netfilter-persistent save 2>/dev/null || \
@@ -839,6 +871,24 @@ main() {
         extra_args="--boot uefi=off"
     fi
 
+    # 检测 KVM 加速是否可用，自动选择 virt-type
+    local virt_type="qemu"
+    if [[ -e /dev/kvm ]] && [[ -w /dev/kvm ]]; then
+        virt_type="kvm"
+        _green "  KVM acceleration available, using --virt-type kvm"
+    else
+        # 尝试加载 KVM 模块
+        modprobe kvm 2>/dev/null || true
+        modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+        sleep 1
+        if [[ -e /dev/kvm ]] && [[ -w /dev/kvm ]]; then
+            virt_type="kvm"
+            _green "  KVM acceleration available (after modprobe), using --virt-type kvm"
+        else
+            _yellow "  KVM not available, using TCG (--virt-type qemu) - performance will be slower"
+        fi
+    fi
+
     # 检测 os_info 是否在本机 osinfo 数据库中存在，不存在则用通用值
     local effective_os_variant="$os_info"
     local osinfo_list
@@ -858,6 +908,7 @@ main() {
         --name "$name" \
         --memory "$memory" \
         --vcpus "$cpu" \
+        --virt-type "$virt_type" \
         --import \
         --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
         --disk "path=${ci_iso},device=cdrom" \
@@ -868,14 +919,18 @@ main() {
         --console pty,target_type=serial \
         --noautoconsole \
         $extra_args \
-        2>/dev/null
+        2>&1
+    local virt_rc=$?
 
-    if [[ $? -ne 0 ]]; then
-        _red "virt-install failed! Trying with detect=on,require=off..."
+    if [[ $virt_rc -ne 0 ]]; then
+        _yellow "virt-install failed (rc=$virt_rc), retrying with detect=on,require=off..."
+        # 清理可能残留的 domain 定义
+        virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
         virt-install \
             --name "$name" \
             --memory "$memory" \
             --vcpus "$cpu" \
+            --virt-type "$virt_type" \
             --import \
             --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
             --disk "path=${ci_iso},device=cdrom" \
@@ -885,13 +940,40 @@ main() {
             --serial pty \
             --console pty,target_type=serial \
             --noautoconsole \
-            $extra_args
-        if [[ $? -ne 0 ]]; then
-            _red "VM deployment failed"
-            virsh undefine "$name" 2>/dev/null || true
-            rm -f "$vm_disk" "$ci_iso" 2>/dev/null || true
-            exit 1
-        fi
+            $extra_args \
+            2>&1
+        virt_rc=$?
+    fi
+
+    # 如果 KVM 模式失败，自动降级到 TCG
+    if [[ $virt_rc -ne 0 && "$virt_type" == "kvm" ]]; then
+        _yellow "KVM mode failed, falling back to TCG (--virt-type qemu)..."
+        virt_type="qemu"
+        virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
+        virt-install \
+            --name "$name" \
+            --memory "$memory" \
+            --vcpus "$cpu" \
+            --virt-type qemu \
+            --import \
+            --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
+            --disk "path=${ci_iso},device=cdrom" \
+            --network "network=default,mac=${vm_mac},model=virtio" \
+            --os-variant detect=on,require=off \
+            --graphics none \
+            --serial pty \
+            --console pty,target_type=serial \
+            --noautoconsole \
+            $extra_args \
+            2>&1
+        virt_rc=$?
+    fi
+
+    if [[ $virt_rc -ne 0 ]]; then
+        _red "VM deployment failed"
+        virsh undefine "$name" 2>/dev/null || true
+        rm -f "$vm_disk" "$ci_iso" 2>/dev/null || true
+        exit 1
     fi
 
     _green "  ✓ VM created: $name"

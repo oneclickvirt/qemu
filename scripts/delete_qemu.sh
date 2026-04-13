@@ -4,7 +4,8 @@
 # 2026.03.02
 
 # 删除单个虚拟机脚本
-# Usage: ./delete_qemu.sh <vm_name>
+# Usage: ./delete_qemu.sh <vm_name> [-y]
+# -y / --yes / --force: 跳过确认提示
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -16,7 +17,16 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
-vm_name="${1:-}"
+# 支持 -y / --force / --yes 跳过确认
+force_mode=false
+vm_name=""
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes|--force) force_mode=true ;;
+        *) [[ -z "$vm_name" ]] && vm_name="$arg" ;;
+    esac
+done
+
 if [[ -z "$vm_name" ]]; then
     # 显示所有虚拟机
     echo "当前虚拟机列表 / Current VMs:"
@@ -37,10 +47,12 @@ if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
 fi
 
 _yellow "即将删除虚拟机 / About to delete VM: $vm_name"
-read -rp "$(echo -e "\033[31m确认删除？输入 yes 继续 / Confirm? (yes): \033[0m")" confirm
-if [[ "$confirm" != "yes" ]]; then
-    _yellow "已取消 / Cancelled"
-    exit 0
+if [[ "$force_mode" != true ]]; then
+    read -rp "$(echo -e "\033[31m确认删除？输入 yes 继续 / Confirm? (yes): \033[0m")" confirm
+    if [[ "$confirm" != "yes" ]]; then
+        _yellow "已取消 / Cancelled"
+        exit 0
+    fi
 fi
 
 # ======== 1. 关闭 VM ========
