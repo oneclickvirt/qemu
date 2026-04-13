@@ -42,6 +42,16 @@ else
     system="debian"
 fi
 
+# ======== 参数验证 ========
+if [[ ! "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+    _red "VM name must start with a letter and contain only letters, digits, underscore, hyphen"
+    exit 1
+fi
+if [[ ! "$passwd" =~ ^[a-zA-Z0-9@%+=.,/_:-]+$ ]]; then
+    _red "Password contains unsafe characters. Allowed: a-zA-Z0-9@%+=.,/_:-"
+    exit 1
+fi
+
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
@@ -509,15 +519,20 @@ allocate_ip() {
 }
 
 # ======== 创建 cloud-init 配置 ========
-create_cloudinit() {
+#   1. 使用 --cloud-init user-data=...,disable=on 传入（virt-install >= 4.0）
+#   2. 不安装额外软件包（避免在 TCG 模式下极其缓慢）
+#   3. cloud-init 完成后自动 shutdown，由后台守护进程重启 VM
+# 回退方案：若 virt-install 不支持 --cloud-init，则手动创建 ISO
+
+create_cloudinit_yaml() {
     local vm_name="$1"
     local password="$2"
     local tmp_yaml="/tmp/qemu-cloudinit-${vm_name}.yaml"
-    local tmp_iso="${images_path}/vm-${vm_name}-cloudinit.iso"
 
     cat > "$tmp_yaml" <<CIEOF
 #cloud-config
 hostname: ${vm_name}
+locale: en_US.UTF-8
 disable_root: false
 ssh_pwauth: true
 chpasswd:
@@ -532,26 +547,41 @@ write_files:
       PubkeyAuthentication yes
 runcmd:
   - systemctl enable --now serial-getty@ttyS0.service 2>/dev/null || true
+  - echo 'root:${password}' | chpasswd
   - |
     if [ -f /etc/ssh/sshd_config ]; then
       sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
       sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
     fi
   - systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent 2>/dev/null || yum install -y qemu-guest-agent 2>/dev/null || dnf install -y qemu-guest-agent 2>/dev/null || true
-  - systemctl enable qemu-guest-agent 2>/dev/null || true
-  - systemctl start qemu-guest-agent 2>/dev/null || true
-  - shutdown -P now
+final_message: "cloud-init done after \$UPTIME seconds"
 CIEOF
 
-    # 生成 cloud-init ISO (NoCloud 数据源)
+    echo "$tmp_yaml"
+}
+
+# 检测 virt-install 是否支持 --cloud-init 参数
+check_cloudinit_support() {
+    if virt-install --cloud-init help 2>/dev/null | grep -q "user-data"; then
+        return 0
+    fi
+    return 1
+}
+
+# 回退方案：手动创建 cloud-init ISO（用于不支持 --cloud-init 的旧版 virt-install）
+create_cloudinit_iso() {
+    local vm_name="$1"
+    local password="$2"
+    local tmp_yaml
+    tmp_yaml=$(create_cloudinit_yaml "$vm_name" "$password")
+    local tmp_iso="${images_path}/vm-${vm_name}-cloudinit.iso"
+
     local meta_yaml="/tmp/qemu-cloudinit-${vm_name}-meta.yaml"
     cat > "$meta_yaml" <<METAEOF
 instance-id: ${vm_name}
 local-hostname: ${vm_name}
 METAEOF
 
-    # 使用 cloud-localds 或 genisoimage 创建 ISO
     if command -v cloud-localds >/dev/null 2>&1; then
         cloud-localds "$tmp_iso" "$tmp_yaml" "$meta_yaml"
     elif command -v genisoimage >/dev/null 2>&1; then
@@ -575,7 +605,6 @@ METAEOF
     fi
 
     rm -f "$tmp_yaml" "$meta_yaml"
-    # 验证 ISO 确实已生成
     if [[ ! -s "$tmp_iso" ]]; then
         echo "ERROR: cloud-init ISO was not created: $tmp_iso" >&2
         exit 1
@@ -599,101 +628,85 @@ create_disk() {
     echo "$vm_disk"
 }
 
-# ======== 配置端口转发 ========
-configure_port_forwarding() {
-    local vm_name="$1"
-    local vm_ip="$2"
-    local ssh_port="$3"
-    local start_p="$4"
-    local end_p="$5"
-    local iface="$bridge_name"
+# ======== 防火墙检测与管理 ========
+FW_BACKEND=""
+detect_fw() {
+    if [[ -f /usr/local/bin/qemu_fw_backend ]]; then
+        FW_BACKEND=$(cat /usr/local/bin/qemu_fw_backend)
+    fi
+    if [[ "$FW_BACKEND" != "nft" && "$FW_BACKEND" != "iptables" ]]; then
+        if command -v nft >/dev/null 2>&1; then
+            FW_BACKEND="nft"
+        elif command -v iptables >/dev/null 2>&1; then
+            FW_BACKEND="iptables"
+        else
+            _red "No firewall tool available (nft or iptables)"
+            exit 1
+        fi
+    fi
+}
 
-    _yellow "Configuring port forwarding for ${vm_name}: SSH=${ssh_port}, ports ${start_p}-${end_p}"
+fw_init_table() {
+    if [[ "$FW_BACKEND" == "nft" ]]; then
+        nft add table ip qemu 2>/dev/null || true
+        nft 'add chain ip qemu prerouting { type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+        nft 'add chain ip qemu postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+        nft 'add chain ip qemu forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+        if ! nft list chain ip qemu postrouting 2>/dev/null | grep -q masquerade; then
+            nft add rule ip qemu postrouting ip saddr 192.168.122.0/24 ip daddr != 192.168.122.0/24 masquerade 2>/dev/null || true
+        fi
+        if ! nft list chain ip qemu forward 2>/dev/null | grep -q "ct state"; then
+            nft add rule ip qemu forward ct state established,related accept 2>/dev/null || true
+            nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
+            nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
+        fi
+    else
+        iptables -t nat -C POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
+        iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+    fi
+}
 
-    # 在 /etc/libvirt/hooks/qemu 中追加规则
-    # 先添加标识符（用于删除）
-    # 使用行首匹配，避免 ###vm1### 结束标记被误匹
-    if ! grep -qE "^#${vm_name}#$" /etc/libvirt/hooks/qemu 2>/dev/null; then
-        cat >> /etc/libvirt/hooks/qemu <<HOOKEOF
-
-#${vm_name}#
-if [ "\${1}" = "${vm_name}" ]; then
-    if [ "\${2}" = "stopped" ] || [ "\${2}" = "reconnect" ]; then
-        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
-HOOKEOF
+fw_add_vm() {
+    local vm_name="$1" vm_ip="$2" ssh_port="$3" start_p="$4" end_p="$5"
+    _yellow "Adding firewall rules for ${vm_name} (${FW_BACKEND})..."
+    if [[ "$FW_BACKEND" == "nft" ]]; then
+        # SSH DNAT (single port → port 22)
+        nft add rule ip qemu prerouting tcp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\""
+        nft add rule ip qemu prerouting udp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\""
+        # Port range DNAT (identity mapping: keep original port)
+        if [[ "$start_p" -le "$end_p" ]]; then
+            nft add rule ip qemu prerouting tcp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\""
+            nft add rule ip qemu prerouting udp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\""
+        fi
+    else
+        iptables -t nat -I PREROUTING -p tcp --dport "$ssh_port" -j DNAT --to "${vm_ip}:22"
+        iptables -t nat -I PREROUTING -p udp --dport "$ssh_port" -j DNAT --to "${vm_ip}:22"
         for ((port=start_p; port<=end_p; port++)); do
-            cat >> /etc/libvirt/hooks/qemu <<PORTEOF
-        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-PORTEOF
+            iptables -t nat -I PREROUTING -p tcp --dport "$port" -j DNAT --to "${vm_ip}:${port}"
+            iptables -t nat -I PREROUTING -p udp --dport "$port" -j DNAT --to "${vm_ip}:${port}"
         done
-        cat >> /etc/libvirt/hooks/qemu <<HOOKEOF2
     fi
-    if [ "\${2}" = "start" ] || [ "\${2}" = "reconnect" ]; then
-        # 先删除已有规则防止重复（幂等操作）
-        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
-        # 添加规则
-        /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22
-        /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT
-        /sbin/iptables -t nat -I PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22
-        /sbin/iptables -I FORWARD -o ${iface} -p udp -d ${vm_ip} --dport 22 -j ACCEPT
-HOOKEOF2
-        for ((port=start_p; port<=end_p; port++)); do
-            cat >> /etc/libvirt/hooks/qemu <<PORTEOF2
-        /sbin/iptables -t nat -D PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -D PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -D FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port}
-        /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT
-        /sbin/iptables -t nat -I PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port}
-        /sbin/iptables -I FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT
-PORTEOF2
-        done
-        cat >> /etc/libvirt/hooks/qemu <<HOOKEOF3
+    _green "  ✓ Port forwarding rules applied"
+}
+
+fw_save() {
+    if [[ "$FW_BACKEND" == "nft" ]]; then
+        mkdir -p /etc/nftables.d
+        {
+            echo "# QEMU VM port forwarding - managed by oneclickvirt/qemu"
+            echo "table ip qemu"
+            echo "delete table ip qemu"
+            nft list table ip qemu
+        } > /etc/nftables.d/qemu.nft 2>/dev/null || true
+    else
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
-fi
-###${vm_name}###
-HOOKEOF3
-    fi
-
-    # 确保 NAT 出站和通用转发规则存在（libvirt default 网络 MASQUERADE，仅需一次）
-    iptables -t nat -C POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -I POSTROUTING -s "192.168.122.0/24" ! -d "192.168.122.0/24" -j MASQUERADE 2>/dev/null || true
-    iptables -C FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-        iptables -I FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || \
-        iptables -I FORWARD -s "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || \
-        iptables -I FORWARD -d "192.168.122.0/24" -j ACCEPT 2>/dev/null || true
-
-    # 立即应用 per-VM 的 DNAT/FORWARD 端口规则（确保首次创建即可用，不等到 VM lifecycle hook）
-    _yellow "Applying iptables rules immediately for ${vm_name}..."
-    /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-    /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport 22 -j ACCEPT 2>/dev/null || true
-    /sbin/iptables -t nat -I PREROUTING -p udp --dport ${ssh_port} -j DNAT --to ${vm_ip}:22 2>/dev/null || true
-    for ((port=start_p; port<=end_p; port++)); do
-        /sbin/iptables -t nat -I PREROUTING -p tcp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -I FORWARD -o ${iface} -p tcp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-        /sbin/iptables -t nat -I PREROUTING -p udp --dport ${port} -j DNAT --to ${vm_ip}:${port} 2>/dev/null || true
-        /sbin/iptables -I FORWARD -o ${iface} -p udp -d ${vm_ip} --dport ${port} -j ACCEPT 2>/dev/null || true
-    done
-    _green "  ✓ iptables rules applied immediately"
-
-    # 持久化保存
-    netfilter-persistent save 2>/dev/null || \
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-        service iptables save 2>/dev/null || true
-
-    _green "Port forwarding configured"
 }
 
 # ======== 检测公网 IP ========
@@ -770,39 +783,55 @@ ensure_default_network() {
     fi
 }
 
-# ======== 后台守护：cloud-init 首次关机后自动重启 VM ========
-# 参考 bashvm 的处理方式：不阻塞主脚本，由后台进程完成"等待关机→重启"
-# 日志写入 /tmp/qemu-init-<name>.log，方便排查
-spawn_restart_daemon() {
+# ======== 后台守护：等待 VM 准备就绪（SSH 可用） ========
+# 不再依赖 cloud-init shutdown + restart 循环（在 TCG 模式下极其缓慢）
+# VM 保持运行，cloud-init 在后台配置完成后 SSH 即可用
+spawn_readiness_daemon() {
     local vm_name="$1"
+    local vm_ip="$2"
+    local ssh_port="$3"
     local log_file="/tmp/qemu-init-${vm_name}.log"
-    # 使用 nohup + 独立子 shell，主脚本退出后仍继续运行
+    local max_wait_time=900
+    if [[ -e /dev/kvm ]]; then
+        max_wait_time=300  # KVM 模式 5 分钟就够了
+    fi
     nohup bash -c "
-        echo \"[\$(date)] Waiting for cloud-init firstboot shutdown of ${vm_name}...\" >> \"${log_file}\"
-        max_wait=1800  # 最多等 30 分钟（包含 apt 安装耗时，Debian 13 可能较慢）
+        echo \"[\$(date)] Waiting for VM ${vm_name} to become ready (SSH on ${vm_ip}:22)...\" >> \"${log_file}\"
+        echo \"[\$(date)] Max wait: ${max_wait_time}s\" >> \"${log_file}\"
+        max_wait=${max_wait_time}
         elapsed=0
         while true; do
             state=\$(virsh domstate '${vm_name}' 2>/dev/null || echo 'error')
-            if [[ \"\$state\" == 'shut off' ]]; then
-                echo \"[\$(date)] VM ${vm_name} has shut off (cloud-init done). Starting...\" >> \"${log_file}\"
-                virsh start '${vm_name}' >> \"${log_file}\" 2>&1
+            if [[ \"\$state\" != 'running' ]]; then
+                echo \"[\$(date)] VM ${vm_name} is not running (state=\${state}). Trying to start...\" >> \"${log_file}\"
+                virsh start '${vm_name}' >> \"${log_file}\" 2>&1 || true
+                sleep 10
+                (( elapsed += 10 ))
+                continue
+            fi
+            # 检查 SSH 是否可用
+            if timeout 3 bash -c \"echo | nc -w2 ${vm_ip} 22\" >/dev/null 2>&1; then
+                echo \"[\$(date)] VM ${vm_name} is ready! SSH available on ${vm_ip}:22\" >> \"${log_file}\"
                 echo \"[\$(date)] Done.\" >> \"${log_file}\"
                 exit 0
             fi
             if (( elapsed >= max_wait )); then
-                echo \"[\$(date)] Timeout \${max_wait}s waiting for shutdown. Forcing off then starting...\" >> \"${log_file}\"
-                virsh destroy '${vm_name}' >> \"${log_file}\" 2>&1 || true
-                sleep 3
-                virsh start  '${vm_name}' >> \"${log_file}\" 2>&1
+                echo \"[\$(date)] Timeout \${max_wait}s waiting for SSH. VM may need more time in TCG mode.\" >> \"${log_file}\"
                 exit 1
             fi
-            sleep 5
-            (( elapsed += 5 ))
+            sleep 10
+            (( elapsed += 10 ))
+            if (( elapsed % 60 == 0 )); then
+                echo \"[\$(date)] Still waiting... elapsed=\${elapsed}s state=\${state}\" >> \"${log_file}\"
+            fi
         done
     " >> "$log_file" 2>&1 &
     disown
-    _yellow "  Cloud-init running in background. VM will auto-restart when done."
+    _yellow "  VM booting in background. SSH will become available when cloud-init finishes."
     _yellow "  Progress: tail -f ${log_file}"
+    if [[ ! -e /dev/kvm ]]; then
+        _yellow "  ⚠ TCG mode: boot may take 10-20+ minutes without KVM acceleration"
+    fi
 }
 
 # ======== 主逻辑 ========
@@ -832,16 +861,32 @@ main() {
     local vm_disk
     vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to create VM disk"; exit 1; }
 
-    # 创建 cloud-init ISO
+    # 创建 cloud-init 配置
     _yellow "Creating cloud-init configuration..."
-    local ci_iso
-    ci_iso=$(create_cloudinit "$name" "$passwd") || { _red "Failed to create cloud-init ISO"; exit 1; }
+    local use_cloudinit_flag=false
+    local ci_yaml=""
+    local ci_iso=""
+    # 始终使用手动创建 ISO 的方式（更可靠，virt-install --cloud-init 存在 user-data 为空的 bug）
+    ci_iso=$(create_cloudinit_iso "$name" "$passwd") || { _red "Failed to create cloud-init ISO"; exit 1; }
     _green "  ✓ cloud-init ISO: $ci_iso"
 
-    # ── 先配置好网络/钩子，再启动 VM（参考 bashvm 的做法）──────────────
+    # ── 先配置好网络/钩子，再启动 VM──────────────
 
     # 在 libvirt default 网络中设置 DHCP 固定 IP（MAC 已知，无需等待首次启动）
+    # 先删除旧的 DHCP 预留（若同名 VM 之前创建过但未完整清理）
     _yellow "Setting DHCP reservation: $vm_mac -> $vm_ip"
+    local old_dhcp_mac old_dhcp_ip
+    old_dhcp_mac=$(virsh net-dumpxml default 2>/dev/null | grep "name='${name}'" | grep -oP "mac='[^']+'" | cut -d"'" -f2 || true)
+    if [[ -n "$old_dhcp_mac" ]]; then
+        old_dhcp_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 || true)
+        _yellow "  Removing stale DHCP reservation: ${old_dhcp_mac} -> ${old_dhcp_ip}"
+        virsh net-update default delete ip-dhcp-host \
+            "<host mac='${old_dhcp_mac}' name='${name}' ip='${old_dhcp_ip}' />" \
+            --live --config 2>/dev/null || \
+        virsh net-update default delete ip-dhcp-host \
+            "<host mac='${old_dhcp_mac}' name='${name}' ip='${old_dhcp_ip}' />" \
+            --config 2>/dev/null || true
+    fi
     virsh net-update default add ip-dhcp-host \
         "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
         --live --config 2>/dev/null || \
@@ -850,26 +895,36 @@ main() {
         --config 2>/dev/null || true
     _green "  ✓ DHCP reservation: $vm_mac -> $vm_ip"
 
-    # 配置端口转发（写入 /etc/libvirt/hooks/qemu）
-    configure_port_forwarding "$name" "$vm_ip" "$sshport" "$startport" "$endport"
+    # 配置端口转发
+    detect_fw
+    fw_init_table
+    fw_add_vm "$name" "$vm_ip" "$sshport" "$startport" "$endport"
+    fw_save
 
-    # 重启 libvirtd 使 hooks 生效，再确认网络就绪
-    _yellow "Restarting libvirtd to apply hooks..."
-    systemctl restart libvirtd 2>/dev/null || systemctl restart libvirt-daemon 2>/dev/null || true
-    sleep 2
-    if ! virsh net-list 2>/dev/null | grep -q "default.*active"; then
-        _yellow "  Restarting default network after libvirtd restart..."
-        virsh net-start default 2>/dev/null || true
-        sleep 2
+    # 清除目标 IP 的旧 dnsmasq 租约（防止旧 MAC 的租约阻止新 MAC 获取预留 IP）
+    # 使用 python3 精确删除，不影响其他 VM 的租约
+    local lease_file="/var/lib/libvirt/dnsmasq/virbr0.status"
+    if [[ -f "$lease_file" ]]; then
+        python3 -c "
+import json, sys
+try:
+    with open('$lease_file') as f:
+        leases = json.load(f)
+    new_leases = [l for l in leases if l.get('ip-address') != '$vm_ip']
+    if len(new_leases) != len(leases):
+        with open('$lease_file', 'w') as f:
+            json.dump(new_leases, f, indent=2)
+        print('  Cleared stale DHCP lease for $vm_ip')
+except:
+    pass
+" 2>/dev/null || true
     fi
+    # 刷新 dnsmasq 使其重新读取租约（发送 SIGHUP）
+    pkill -HUP dnsmasq 2>/dev/null || true
 
     # ── 部署虚拟机 ──────────────────────────────────────────────────────
 
     _yellow "Deploying VM with virt-install..."
-    local extra_args=""
-    if [[ "$ARCH_TYPE" == "aarch64" || "$ARCH_TYPE" == "arm64" ]]; then
-        extra_args="--boot uefi=off"
-    fi
 
     # 检测 KVM 加速是否可用，自动选择 virt-type
     local virt_type="qemu"
@@ -904,44 +959,63 @@ main() {
         fi
     fi
 
-    virt-install \
-        --name "$name" \
-        --memory "$memory" \
-        --vcpus "$cpu" \
-        --virt-type "$virt_type" \
-        --import \
-        --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
-        --disk "path=${ci_iso},device=cdrom" \
-        --network "network=default,mac=${vm_mac},model=virtio" \
-        --os-variant "$effective_os_variant" \
-        --graphics none \
-        --serial pty \
-        --console pty,target_type=serial \
-        --noautoconsole \
-        $extra_args \
-        2>&1
+    # 构建 virt-install 命令参数
+    # 使用手动创建的 cloud-init ISO（比 --cloud-init 更可靠）
+    # --sysinfo 添加 NoCloud DMI 提示，让 cloud-init 识别 NoCloud 数据源
+    # cloud-init ISO 使用 virtio 总线（而非 CDROM/SATA），因为部分 guest 镜像没有 AHCI 驱动
+    local -a extra_opts=()
+    if [[ "$ARCH_TYPE" == "aarch64" || "$ARCH_TYPE" == "arm64" ]]; then
+        extra_opts=(--boot uefi=off)
+    fi
+
+    local -a virt_cmd=(
+        virt-install
+        --name "$name"
+        --memory "$memory"
+        --vcpus "$cpu"
+        --virt-type "$virt_type"
+        --import
+        --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none"
+        --disk "path=${ci_iso},format=raw,bus=virtio,readonly=on"
+        --network "network=default,mac=${vm_mac},model=virtio"
+        --os-variant "$effective_os_variant"
+        --sysinfo "type=smbios,system.serial=ds=nocloud"
+        --graphics none
+        --serial pty
+        --console "pty,target_type=serial"
+        --noautoconsole
+        "${extra_opts[@]}"
+    )
+
+    "${virt_cmd[@]}" 2>&1
     local virt_rc=$?
 
     if [[ $virt_rc -ne 0 ]]; then
         _yellow "virt-install failed (rc=$virt_rc), retrying with detect=on,require=off..."
-        # 清理可能残留的 domain 定义
         virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
-        virt-install \
-            --name "$name" \
-            --memory "$memory" \
-            --vcpus "$cpu" \
-            --virt-type "$virt_type" \
-            --import \
-            --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
-            --disk "path=${ci_iso},device=cdrom" \
-            --network "network=default,mac=${vm_mac},model=virtio" \
-            --os-variant detect=on,require=off \
-            --graphics none \
-            --serial pty \
-            --console pty,target_type=serial \
-            --noautoconsole \
-            $extra_args \
-            2>&1
+        # 重建磁盘（可能被 undefine --remove-all-storage 删除）
+        if [[ ! -f "$vm_disk" ]]; then
+            vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to re-create VM disk"; exit 1; }
+        fi
+        virt_cmd=(
+            virt-install
+            --name "$name"
+            --memory "$memory"
+            --vcpus "$cpu"
+            --virt-type "$virt_type"
+            --import
+            --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none"
+            --disk "path=${ci_iso},format=raw,bus=virtio,readonly=on"
+            --network "network=default,mac=${vm_mac},model=virtio"
+            --os-variant "detect=on,require=off"
+            --sysinfo "type=smbios,system.serial=ds=nocloud"
+            --graphics none
+            --serial pty
+            --console "pty,target_type=serial"
+            --noautoconsole
+            "${extra_opts[@]}"
+        )
+        "${virt_cmd[@]}" 2>&1
         virt_rc=$?
     fi
 
@@ -950,24 +1024,33 @@ main() {
         _yellow "KVM mode failed, falling back to TCG (--virt-type qemu)..."
         virt_type="qemu"
         virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
-        virt-install \
-            --name "$name" \
-            --memory "$memory" \
-            --vcpus "$cpu" \
-            --virt-type qemu \
-            --import \
-            --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none" \
-            --disk "path=${ci_iso},device=cdrom" \
-            --network "network=default,mac=${vm_mac},model=virtio" \
-            --os-variant detect=on,require=off \
-            --graphics none \
-            --serial pty \
-            --console pty,target_type=serial \
-            --noautoconsole \
-            $extra_args \
-            2>&1
+        if [[ ! -f "$vm_disk" ]]; then
+            vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to re-create VM disk"; exit 1; }
+        fi
+        virt_cmd=(
+            virt-install
+            --name "$name"
+            --memory "$memory"
+            --vcpus "$cpu"
+            --virt-type qemu
+            --import
+            --disk "path=${vm_disk},format=qcow2,bus=virtio,cache=none"
+            --disk "path=${ci_iso},format=raw,bus=virtio,readonly=on"
+            --network "network=default,mac=${vm_mac},model=virtio"
+            --os-variant "detect=on,require=off"
+            --sysinfo "type=smbios,system.serial=ds=nocloud"
+            --graphics none
+            --serial pty
+            --console "pty,target_type=serial"
+            --noautoconsole
+            "${extra_opts[@]}"
+        )
+        "${virt_cmd[@]}" 2>&1
         virt_rc=$?
     fi
+
+    # 清理临时文件
+    rm -f /tmp/qemu-cloudinit-${name}.yaml /tmp/qemu-cloudinit-${name}-meta.yaml 2>/dev/null || true
 
     if [[ $virt_rc -ne 0 ]]; then
         _red "VM deployment failed"
@@ -978,12 +1061,12 @@ main() {
 
     _green "  ✓ VM created: $name"
 
-    # 设置 VM 开机自启（cloud-init 完成后的正常启动也走 autostart 路径）
+    # 设置 VM 开机自启
     virsh autostart "$name" 2>/dev/null || true
 
-    # ── 不阻塞等待 cloud-init——后台守护进程负责重启 VM ──────────────────
-    # cloud-init runcmd 最后执行 shutdown -P now，VM 关机后后台进程自动 virsh start
-    spawn_restart_daemon "$name"
+    # ── 后台守护进程监控 VM 就绪状态 ────────────────────
+    # VM 保持运行，cloud-init 在后台配置，完成后 SSH 即可用
+    spawn_readiness_daemon "$name" "$vm_ip" "$sshport"
 
     # 检测公网 IP
     check_ipv4
@@ -1005,7 +1088,7 @@ main() {
     fi
     _green "  密码:     ${passwd}"
     _green "  端口映射: ${startport}-${endport} → ${startport}-${endport} (NAT)"
-    _green "  初始化:   cloud-init 正在后台运行，完成后 VM 将自动重启"
+    _green "  初始化:   cloud-init 正在后台运行，SSH 就绪后可连接"
     _green "  进度查看: tail -f /tmp/qemu-init-${name}.log"
     _green "======================================================"
 

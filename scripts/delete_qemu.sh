@@ -70,29 +70,59 @@ fi
 if command -v virsh >/dev/null 2>&1; then
     vm_mac=$(virsh domiflist "$vm_name" 2>/dev/null | grep virtio | awk '{print $5}' | head -1)
 fi
+# 如果 vmlog 没有 IP，从 DHCP 预留中获取
+if [[ -z "$vm_ip" ]]; then
+    vm_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 || true)
+fi
 
-# ======== 3. 清理端口转发（hooks 和 iptables）========
+# ======== 3. 清理端口转发 ========
 _yellow "[2/5] 清理端口转发规则..."
-if [[ -f /etc/libvirt/hooks/qemu ]]; then
-    # 提取 VM 的 iptables -I / -A 规则并执行相应的 -D（删除）
-    in_block=false
-    while IFS= read -r line; do
-        if echo "$line" | grep -qE "^#${vm_name}#$"; then
-            in_block=true
-            continue
-        fi
-        if echo "$line" | grep -qE "^###${vm_name}###$"; then
-            in_block=false
-            continue
-        fi
-        if $in_block; then
-            # 将 -I 或 -A 替换为 -D 然后执行
-            del_rule=$(echo "$line" | sed 's/iptables -I /iptables -D /g; s/iptables -A /iptables -D /g')
-            eval "$del_rule" 2>/dev/null || true
-        fi
-    done < /etc/libvirt/hooks/qemu
 
-    # 从 hooks 文件中删除该 VM 的规则块
+# 检测防火墙后端
+FW_BACKEND=""
+if [[ -f /usr/local/bin/qemu_fw_backend ]]; then
+    FW_BACKEND=$(cat /usr/local/bin/qemu_fw_backend)
+fi
+if [[ "$FW_BACKEND" != "nft" && "$FW_BACKEND" != "iptables" ]]; then
+    if command -v nft >/dev/null 2>&1; then
+        FW_BACKEND="nft"
+    elif command -v iptables >/dev/null 2>&1; then
+        FW_BACKEND="iptables"
+    fi
+fi
+
+if [[ "$FW_BACKEND" == "nft" ]]; then
+    # 删除 nft qemu 表中该 VM 的所有规则（通过 comment 匹配）
+    nft -a list chain ip qemu prerouting 2>/dev/null | grep "\"vm:${vm_name}\"" | grep -oP '# handle \K[0-9]+' | while read -r h; do
+        nft delete rule ip qemu prerouting handle "$h" 2>/dev/null || true
+    done
+    _green "  ✓ nftables 规则已清理"
+    # 持久化
+    mkdir -p /etc/nftables.d
+    {
+        echo "# QEMU VM port forwarding - managed by oneclickvirt/qemu"
+        echo "table ip qemu"
+        echo "delete table ip qemu"
+        nft list table ip qemu
+    } > /etc/nftables.d/qemu.nft 2>/dev/null || true
+elif [[ "$FW_BACKEND" == "iptables" ]]; then
+    # iptables: 删除所有指向该 VM IP 的 DNAT/FORWARD 规则
+    if [[ -n "$vm_ip" ]]; then
+        while iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT.*${vm_ip}[:/]"; do
+            rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT.*${vm_ip}[:/]" | head -1 | sed 's/^-A /-D /')
+            iptables -t nat $rule 2>/dev/null || break
+        done
+        while iptables -S FORWARD 2>/dev/null | grep -q -- "-d ${vm_ip}"; do
+            rule=$(iptables -S FORWARD 2>/dev/null | grep -- "-d ${vm_ip}" | head -1 | sed 's/^-A /-D /')
+            iptables $rule 2>/dev/null || break
+        done
+    fi
+    _green "  ✓ iptables 规则已清理"
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
+
+# 清理 hooks 文件中该 VM 的条目（如有遗留）
+if [[ -f /etc/libvirt/hooks/qemu ]] && grep -qE "^#${vm_name}#$" /etc/libvirt/hooks/qemu 2>/dev/null; then
     tmpfile=$(mktemp)
     skip=false
     while IFS= read -r line; do
@@ -110,17 +140,23 @@ if [[ -f /etc/libvirt/hooks/qemu ]]; then
     done < /etc/libvirt/hooks/qemu
     mv "$tmpfile" /etc/libvirt/hooks/qemu
     chmod +x /etc/libvirt/hooks/qemu
-    _green "  ✓ iptables 规则已清理"
 fi
-
-# 持久化保存
-netfilter-persistent save 2>/dev/null || \
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-    service iptables save 2>/dev/null || true
 
 # ======== 4. 删除 DHCP 预留 ========
 _yellow "[3/5] 删除 DHCP 预留..."
-if [[ -n "$vm_mac" && -n "$vm_ip" ]]; then
+# 优先从网络 XML 中读取实际的 DHCP 预留信息（比 vmlog 更可靠）
+dhcp_mac=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "mac='[^']+'" | cut -d"'" -f2 || true)
+dhcp_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 || true)
+if [[ -n "$dhcp_mac" && -n "$dhcp_ip" ]]; then
+    virsh net-update default delete ip-dhcp-host \
+        "<host mac='${dhcp_mac}' name='${vm_name}' ip='${dhcp_ip}' />" \
+        --live --config 2>/dev/null || \
+    virsh net-update default delete ip-dhcp-host \
+        "<host mac='${dhcp_mac}' name='${vm_name}' ip='${dhcp_ip}' />" \
+        --config 2>/dev/null || true
+    _green "  ✓ DHCP 预留已删除 (${dhcp_mac} -> ${dhcp_ip})"
+elif [[ -n "$vm_mac" && -n "$vm_ip" ]]; then
+    # 回退：使用 vmlog 中的 IP
     virsh net-update default delete ip-dhcp-host \
         "<host mac='${vm_mac}' name='${vm_name}' ip='${vm_ip}' />" \
         --live --config 2>/dev/null || \
@@ -128,8 +164,8 @@ if [[ -n "$vm_mac" && -n "$vm_ip" ]]; then
         "<host mac='${vm_mac}' ip='${vm_ip}' />" \
         --config 2>/dev/null || true
     _green "  ✓ DHCP 预留已删除"
-elif [[ -n "$vm_mac" ]]; then
-    _yellow "  No IP found for $vm_name, skipping DHCP cleanup"
+else
+    _yellow "  No DHCP reservation found for $vm_name, skipping"
 fi
 
 # ======== 5. 删除 VM 定义和磁盘 ========

@@ -35,8 +35,10 @@ pre_check() {
         fi
     fi
 
-    # 下载 oneqemu.sh（如果不存在）
-    if [[ ! -f /root/scripts/oneqemu.sh ]]; then
+    # 查找 oneqemu.sh（优先同目录，再查 /root/scripts）
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    if [[ ! -f "${script_dir}/oneqemu.sh" ]] && [[ ! -f /root/scripts/oneqemu.sh ]]; then
         mkdir -p /root/scripts
         curl -sL --connect-timeout 10 --max-time 60 \
             "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/oneqemu.sh" \
@@ -171,7 +173,7 @@ build_new_vms() {
     esac
     # 验证系统名称（只检查名称部分，版本由 oneqemu.sh 解析）
     local en_check
-    en_check=$(echo "$system_type" | tr -d '-_' | sed 's/[0-9]*$//' | sed 's/^alma$/almalinux/' | sed 's/^rocky$/rockylinux/' | sed 's/^euler$/openeuler/')
+    en_check=$(echo "$system_type" | tr -d '_\-' | sed 's/[0-9]*$//' | sed 's/^alma$/almalinux/' | sed 's/^rocky$/rockylinux/' | sed 's/^euler$/openeuler/')
     if [[ ! "$en_check" =~ ^(debian|ubuntu|almalinux|rockylinux|openeuler)$ ]]; then
         _yellow "Unknown system '${system_type}', using debian12"
         system_type="debian12"
@@ -183,10 +185,11 @@ build_new_vms() {
     _blue "======================================================"
 
     local scripts_dir
-    if [[ -f /root/scripts/oneqemu.sh ]]; then
-        scripts_dir="/root/scripts"
-    elif [[ -f "$(dirname "$0")/oneqemu.sh" ]]; then
+    # 优先使用与 create_qemu.sh 同目录的 oneqemu.sh
+    if [[ -f "$(dirname "$0")/oneqemu.sh" ]]; then
         scripts_dir="$(dirname "$0")"
+    elif [[ -f /root/scripts/oneqemu.sh ]]; then
+        scripts_dir="/root/scripts"
     else
         scripts_dir="/root"
     fi

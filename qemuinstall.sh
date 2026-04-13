@@ -135,16 +135,16 @@ install_base_deps() {
     case $SYSTEM in
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
                 socat unzip tar jq dnsmasq-base genisoimage 2>/dev/null || true
             ;;
         CentOS|Fedora)
-            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute \
                 socat unzip tar jq dnsmasq genisoimage 2>/dev/null || true
             ;;
         Alpine)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
                 socat unzip tar jq cdrkit 2>/dev/null || true
             ;;
     esac
@@ -157,9 +157,6 @@ install_qemu_stack() {
     case $SYSTEM in
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            # 预设 iptables-persistent 安装应答，避免交互提示
-            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
-            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} \
                 qemu-kvm \
                 qemu-system \
@@ -171,8 +168,7 @@ install_qemu_stack() {
                 bridge-utils \
                 net-tools \
                 sqlite3 \
-                iptables-persistent \
-                netfilter-persistent \
+                nftables \
                 2>/dev/null || true
             ;;
         CentOS|Fedora)
@@ -186,7 +182,7 @@ install_qemu_stack() {
                 bridge-utils \
                 net-tools \
                 sqlite \
-                iptables-services \
+                nftables \
                 2>/dev/null || true
             ;;
         Alpine)
@@ -246,11 +242,7 @@ configure_default_network() {
         cat > /tmp/qemu-default-net.xml <<'NETEOF'
 <network>
   <name>default</name>
-  <forward mode='nat'>
-    <nat>
-      <port start='1024' end='65535'/>
-    </nat>
-  </forward>
+  <forward mode='open'/>
   <bridge name='virbr0' stp='on' delay='0'/>
   <ip address='192.168.122.1' netmask='255.255.255.0'>
     <dhcp>
@@ -295,6 +287,65 @@ HOOKEOF
     fi
 }
 
+# ======== 配置防火墙 ========
+configure_firewall() {
+    _yellow "Configuring firewall rules..."
+    if command -v nft >/dev/null 2>&1; then
+        echo "nft" > /usr/local/bin/qemu_fw_backend
+        _green "  Using nftables backend"
+        # Create dedicated qemu nft table for port forwarding
+        nft add table ip qemu 2>/dev/null || true
+        nft 'add chain ip qemu prerouting { type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+        nft 'add chain ip qemu postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+        nft 'add chain ip qemu forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+        # Add base rules (idempotent)
+        if ! nft list chain ip qemu postrouting 2>/dev/null | grep -q masquerade; then
+            nft add rule ip qemu postrouting ip saddr 192.168.122.0/24 ip daddr != 192.168.122.0/24 masquerade 2>/dev/null || true
+        fi
+        if ! nft list chain ip qemu forward 2>/dev/null | grep -q "ct state"; then
+            nft add rule ip qemu forward ct state established,related accept 2>/dev/null || true
+            nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
+            nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
+        fi
+        # Persist nft rules
+        mkdir -p /etc/nftables.d
+        {
+            echo "# QEMU VM port forwarding - managed by oneclickvirt/qemu"
+            echo "table ip qemu"
+            echo "delete table ip qemu"
+            nft list table ip qemu
+        } > /etc/nftables.d/qemu.nft
+        if [[ -f /etc/nftables.conf ]] && ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
+            echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
+        fi
+        systemctl enable nftables 2>/dev/null || true
+        _green "  ✓ nftables qemu table initialized"
+    elif command -v iptables >/dev/null 2>&1; then
+        echo "iptables" > /usr/local/bin/qemu_fw_backend
+        _green "  Using iptables backend (nft not available)"
+        iptables -t nat -C POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
+        iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+        # Install iptables-persistent for Debian/Ubuntu
+        if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
+            ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent 2>/dev/null || true
+        fi
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        _green "  ✓ iptables base rules configured"
+    else
+        _red "No firewall tool available (nft or iptables)"
+        exit 1
+    fi
+}
+
 # ======== 配置 sysctl 转发参数 ========
 configure_sysctl() {
     _yellow "Configuring sysctl for IP forwarding..."
@@ -302,8 +353,6 @@ configure_sysctl() {
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
 EOF
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-qemu.conf 2>/dev/null || true
     _green "IP forwarding enabled"
@@ -430,6 +479,7 @@ main() {
     configure_storage_pool
     configure_default_network
     configure_hooks
+    configure_firewall
     configure_sysctl
     detect_interface
     check_ipv6
@@ -439,6 +489,13 @@ main() {
     echo "$ARCH_TYPE" > /usr/local/bin/qemu_arch
 
     verify_install
+
+    local fw_info
+    if [[ -f /usr/local/bin/qemu_fw_backend ]]; then
+        fw_info=$(cat /usr/local/bin/qemu_fw_backend)
+    else
+        fw_info="unknown"
+    fi
 
     echo
     _green "======================================================"

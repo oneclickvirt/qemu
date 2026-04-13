@@ -45,6 +45,7 @@ echo ""
 _blue "[1/9] 关闭并删除所有虚拟机..."
 # 杀掉后台 cloud-init 守护进程
 pkill -f "qemu-init-" 2>/dev/null || true
+pkill -f "Waiting for VM" 2>/dev/null || true
 if command -v virsh >/dev/null 2>&1; then
     # 强制关闭所有运行中的VM
     virsh list --name 2>/dev/null | while read -r vm; do
@@ -65,26 +66,37 @@ else
     _yellow "  virsh 未安装，跳过虚拟机清理"
 fi
 
-# ======== 2. 清理 iptables 端口转发规则 ========
-_blue "[2/9] 清理 iptables 端口转发规则..."
-# 删除 libvirt hooks 中的所有自定义规则
-if [[ -f /etc/libvirt/hooks/qemu ]]; then
-    # 提取 hooks 中的 iptables -I / -A 规则（不含 -D 规则），转为 -D 并执行
-    grep -E 'iptables\s+(-t\s+\S+\s+)?-[IA]\s' /etc/libvirt/hooks/qemu 2>/dev/null | \
-        sed 's/-I /-D /g; s/-A /-D /g' | while IFS= read -r line; do
-        eval "$line" 2>/dev/null || true
-    done
+# ======== 2. 清理防火墙规则 ========
+_blue "[2/9] 清理防火墙规则..."
+
+# 清理 nftables qemu 表
+if command -v nft >/dev/null 2>&1; then
+    nft delete table ip qemu 2>/dev/null || true
+    rm -f /etc/nftables.d/qemu.nft 2>/dev/null || true
+    # 移除 nftables.conf 中的 include 指令
+    if [[ -f /etc/nftables.conf ]]; then
+        sed -i '/include "\/etc\/nftables.d\/\*\.nft"/d' /etc/nftables.conf 2>/dev/null || true
+    fi
+    _green "  nftables qemu 表已清理"
 fi
-# 额外清理 QEMU NAT 相关规则
-iptables -t nat -F PREROUTING 2>/dev/null || true
-iptables -t nat -F POSTROUTING 2>/dev/null || true
-iptables -F FORWARD 2>/dev/null || true
-# 保存清空后的 iptables
-netfilter-persistent save 2>/dev/null || \
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-    service iptables save 2>/dev/null || true
-ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-_green "  iptables 规则已清理"
+
+# 清理 iptables 中残留的 qemu 相关规则（不影响非 qemu 规则）
+if command -v iptables >/dev/null 2>&1; then
+    # 清理 PREROUTING 中指向 192.168.122.x 的 DNAT 规则
+    while iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT.*192\.168\.122\."; do
+        rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT.*192\.168\.122\." | head -1 | sed 's/^-A /-D /')
+        iptables -t nat $rule 2>/dev/null || break
+    done
+    # 清理 POSTROUTING MASQUERADE
+    iptables -t nat -D POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
+    # 清理 FORWARD 中 192.168.122.0/24 相关规则
+    iptables -D FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
+_green "  防火墙规则已清理"
 
 # ======== 3. 删除 libvirt 网络 ========
 _blue "[3/9] 删除 libvirt 网络..."
@@ -135,8 +147,10 @@ case $SYSTEM in
     Debian|Ubuntu)
         apt-get remove -y --purge \
             qemu-kvm qemu-system libvirt-daemon-system libvirt-clients virtinst \
-            qemu-utils cloud-image-utils bridge-utils \
-            iptables-persistent netfilter-persistent 2>/dev/null || true
+            qemu-utils cloud-image-utils bridge-utils 2>/dev/null || true
+        # 仅在已安装时才卸载 iptables-persistent
+        dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii" && \
+            apt-get remove -y --purge iptables-persistent netfilter-persistent 2>/dev/null || true
         apt-get autoremove -y 2>/dev/null || true
         ;;
     CentOS|Fedora)
@@ -188,6 +202,7 @@ for f in \
     /usr/local/bin/qemu_ipv6_enabled \
     /usr/local/bin/qemu_main_interface \
     /usr/local/bin/qemu_db_file \
+    /usr/local/bin/qemu_fw_backend \
     /var/lib/libvirt/qemu-vms.db \
     /root/vmlog; do
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
