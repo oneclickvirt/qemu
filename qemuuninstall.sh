@@ -15,7 +15,11 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # 支持 -y / --force / --yes 跳过确认
+# 也支持环境变量：QEMU_FORCE_UNINSTALL=yes
 force_mode=false
+if [[ "${QEMU_FORCE_UNINSTALL:-}" == "yes" || "${QEMU_FORCE_UNINSTALL:-}" == "true" || "${QEMU_FORCE_UNINSTALL:-}" == "1" ]]; then
+    force_mode=true
+fi
 for arg in "$@"; do
     case "$arg" in
         -y|--yes|--force) force_mode=true ;;

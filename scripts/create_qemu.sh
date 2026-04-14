@@ -121,6 +121,8 @@ build_new_vms() {
 
     if [[ -n "$cli_nums" && "$cli_nums" =~ ^[0-9]+$ ]]; then
         new_nums="$cli_nums"
+    elif [[ -n "${VM_COUNT:-}" && "${VM_COUNT}" =~ ^[0-9]+$ ]]; then
+        new_nums="$VM_COUNT"
     else
         reading "需要新增几个虚拟机？ (How many VMs to create?) [default: 1]: " new_nums
         [[ -z "$new_nums" || ! "$new_nums" =~ ^[0-9]+$ ]] && new_nums=1
@@ -128,6 +130,8 @@ build_new_vms() {
 
     if [[ -n "$cli_memory" && "$cli_memory" =~ ^[0-9]+$ ]]; then
         memory_nums="$cli_memory"
+    elif [[ -n "${VM_MEMORY:-}" && "${VM_MEMORY}" =~ ^[0-9]+$ ]]; then
+        memory_nums="$VM_MEMORY"
     else
         reading "每个虚拟机内存大小(MB) (Memory per VM in MB) [default: 1024]: " memory_nums
         [[ -z "$memory_nums" || ! "$memory_nums" =~ ^[0-9]+$ ]] && memory_nums=1024
@@ -135,6 +139,8 @@ build_new_vms() {
 
     if [[ -n "$cli_cpu" && "$cli_cpu" =~ ^[0-9]+$ ]]; then
         cpu_nums="$cli_cpu"
+    elif [[ -n "${VM_CPU:-}" && "${VM_CPU}" =~ ^[0-9]+$ ]]; then
+        cpu_nums="$VM_CPU"
     else
         reading "每个虚拟机 CPU 核数 (CPU cores per VM) [default: 1]: " cpu_nums
         [[ -z "$cpu_nums" || ! "$cpu_nums" =~ ^[0-9]+$ ]] && cpu_nums=1
@@ -142,6 +148,8 @@ build_new_vms() {
 
     if [[ -n "$cli_disk" && "$cli_disk" =~ ^[0-9]+$ ]]; then
         disk_nums="$cli_disk"
+    elif [[ -n "${VM_DISK:-}" && "${VM_DISK}" =~ ^[0-9]+$ ]]; then
+        disk_nums="$VM_DISK"
     else
         reading "每个虚拟机磁盘大小(GB) (Disk size per VM in GB) [default: 20]: " disk_nums
         [[ -z "$disk_nums" || ! "$disk_nums" =~ ^[0-9]+$ ]] && disk_nums=20
@@ -149,6 +157,8 @@ build_new_vms() {
 
     if [[ -n "$cli_system" ]]; then
         system_type="$cli_system"
+    elif [[ -n "${VM_SYSTEM:-}" ]]; then
+        system_type="$VM_SYSTEM"
     else
         _blue "支持的系统 / Supported systems:"
         _blue "  1. debian12 (default)  2. ubuntu22"

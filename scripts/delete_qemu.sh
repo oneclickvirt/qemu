@@ -18,8 +18,12 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # 支持 -y / --force / --yes 跳过确认
+# 也支持环境变量：VM_NAME=<name>  QEMU_FORCE_DELETE=yes
 force_mode=false
-vm_name=""
+if [[ "${QEMU_FORCE_DELETE:-}" == "yes" || "${QEMU_FORCE_DELETE:-}" == "true" || "${QEMU_FORCE_DELETE:-}" == "1" ]]; then
+    force_mode=true
+fi
+vm_name="${VM_NAME:-}"
 for arg in "$@"; do
     case "$arg" in
         -y|--yes|--force) force_mode=true ;;
@@ -32,6 +36,10 @@ if [[ -z "$vm_name" ]]; then
     echo "当前虚拟机列表 / Current VMs:"
     virsh list --all 2>/dev/null
     echo ""
+    if [[ ! -t 0 ]]; then
+        _red "No VM name specified and stdin is not a terminal. Set VM_NAME env or pass name as argument."
+        exit 1
+    fi
     read -rp "$(echo -e "\033[32m请输入要删除的虚拟机名称 / Enter VM name to delete: \033[0m")" vm_name
 fi
 

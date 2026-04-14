@@ -21,6 +21,14 @@
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh)
 ```
 
+**支持环境变量（无交互）：**
+
+```bash
+# 自定义镜像存储路径（默认 /var/lib/libvirt/images）
+export QEMU_IMAGES_PATH=/data/vm-images
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh)
+```
+
 ## 开设单个虚拟机
 
 ```bash
@@ -72,6 +80,24 @@ chmod +x create_qemu.sh
 
 交互式脚本，自动递增虚拟机名（vm1, vm2, ...）、SSH 端口、公网端口，虚拟机信息记录到 `vmlog` 文件。
 
+**支持命令行参数（非交互）：**
+
+```bash
+# ./create_qemu.sh <数量> <内存MB> <CPU> <磁盘GB> <系统类型>
+./create_qemu.sh 3 1024 1 20 debian12
+```
+
+**支持环境变量（无交互一键批量创建）：**
+
+```bash
+export VM_COUNT=3          # 虚拟机数量
+export VM_MEMORY=1024      # 每台内存 MB
+export VM_CPU=1            # 每台 CPU 核数
+export VM_DISK=20          # 每台磁盘 GB
+export VM_SYSTEM=debian12  # 操作系统类型
+./create_qemu.sh
+```
+
 > **说明：** 脚本不会阻塞等待 cloud-init 完成。DHCP 预留和端口转发规则在 VM 启动前已配置完毕，cloud-init 在后台运行；初始化完成（密码设置、SSH 配置等）后 VM 自动关机并重启。可通过以下命令查看初始化进度：
 > ```bash
 > tail -f /tmp/qemu-init-<vm_name>.log
@@ -96,6 +122,16 @@ virsh domifaddr <name>              # 查看虚拟机 IP 地址
 curl -sSL -o delete_qemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/delete_qemu.sh
 chmod +x delete_qemu.sh
 ./delete_qemu.sh <vm_name>
+# 跳过确认直接删除
+./delete_qemu.sh vm1 -y
+```
+
+**支持环境变量（无交互）：**
+
+```bash
+export VM_NAME=vm1
+export QEMU_FORCE_DELETE=yes
+./delete_qemu.sh
 ```
 
 脚本会自动清理：虚拟机定义、磁盘镜像、DHCP 预留、iptables 端口转发规则、日志记录。
@@ -109,6 +145,31 @@ bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuun
 ```
 
 脚本会在执行前要求输入 `yes` 确认，操作不可逆。
+
+**支持环境变量或参数跳过确认（无交互）：**
+
+```bash
+# 方式一：环境变量
+export QEMU_FORCE_UNINSTALL=yes
+bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuuninstall.sh)
+
+# 方式二：命令行参数
+bash qemuuninstall.sh -y
+```
+
+## 环境变量汇总
+
+| 脚本 | 环境变量 | 说明 | 示例值 |
+|------|----------|------|--------|
+| `qemuinstall.sh` | `QEMU_IMAGES_PATH` | 镜像存储路径 | `/data/images` |
+| `qemuuninstall.sh` | `QEMU_FORCE_UNINSTALL` | 跳过卸载确认 | `yes` |
+| `create_qemu.sh` | `VM_COUNT` | 创建虚拟机数量 | `3` |
+| `create_qemu.sh` | `VM_MEMORY` | 每台内存（MB） | `1024` |
+| `create_qemu.sh` | `VM_CPU` | 每台 CPU 核数 | `1` |
+| `create_qemu.sh` | `VM_DISK` | 每台磁盘（GB） | `20` |
+| `create_qemu.sh` | `VM_SYSTEM` | 操作系统类型 | `debian12` |
+| `delete_qemu.sh` | `VM_NAME` | 要删除的虚拟机名 | `vm1` |
+| `delete_qemu.sh` | `QEMU_FORCE_DELETE` | 跳过删除确认 | `yes` |
 
 ## 镜像说明
 

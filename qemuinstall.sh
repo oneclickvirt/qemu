@@ -465,10 +465,13 @@ main() {
         fi
     done
 
-    # 非交互模式：如果 stdin 不是终端（如 curl | bash），使用默认值
-    # 也支持命令行参数：./qemuinstall.sh /path/to/images
+    # 优先级：环境变量 QEMU_IMAGES_PATH > 命令行参数 > 交互输入 > 默认值
+    # 环境变量示例：export QEMU_IMAGES_PATH=/data/images
     local cli_images_path="${1:-}"
-    if [[ -n "$cli_images_path" ]]; then
+    if [[ -n "${QEMU_IMAGES_PATH:-}" ]]; then
+        qemu_images_path="$QEMU_IMAGES_PATH"
+        _yellow "Using QEMU_IMAGES_PATH from environment: $qemu_images_path"
+    elif [[ -n "$cli_images_path" ]]; then
         qemu_images_path="$cli_images_path"
     elif [[ -t 0 ]]; then
         reading "虚拟机镜像存储路径？（回车默认：/var/lib/libvirt/images）：" qemu_images_path
