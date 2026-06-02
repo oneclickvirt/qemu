@@ -16,6 +16,18 @@ _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 export DEBIAN_FRONTEND=noninteractive
 
+is_uint() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+is_positive_uint() {
+    is_uint "$1" && (( 10#$1 > 0 ))
+}
+
+is_port() {
+    is_uint "$1" && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
@@ -51,6 +63,40 @@ if [[ ! "$passwd" =~ ^[a-zA-Z0-9@%+=.,/_:-]+$ ]]; then
     _red "Password contains unsafe characters. Allowed: a-zA-Z0-9@%+=.,/_:-"
     exit 1
 fi
+if ! is_positive_uint "$cpu"; then
+    _red "CPU cores must be a positive integer"
+    exit 1
+fi
+if ! is_positive_uint "$memory"; then
+    _red "Memory must be a positive integer in MB"
+    exit 1
+fi
+if ! is_positive_uint "$disk"; then
+    _red "Disk size must be a positive integer in GB"
+    exit 1
+fi
+if ! is_port "$sshport"; then
+    _red "SSH port must be an integer between 1 and 65535"
+    exit 1
+fi
+if ! is_port "$startport" || ! is_port "$endport"; then
+    _red "Port range must use integers between 1 and 65535"
+    exit 1
+fi
+if (( 10#$startport > 10#$endport )); then
+    _red "Port range start must be less than or equal to end"
+    exit 1
+fi
+if (( 10#$sshport >= 10#$startport && 10#$sshport <= 10#$endport )); then
+    _red "SSH port must not overlap the extra port range"
+    exit 1
+fi
+cpu=$((10#$cpu))
+memory=$((10#$memory))
+disk=$((10#$disk))
+sshport=$((10#$sshport))
+startport=$((10#$startport))
+endport=$((10#$endport))
 
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
@@ -174,6 +220,14 @@ fi
 # ======== 检查 virt-install ========
 if ! command -v virt-install >/dev/null 2>&1; then
     _red "virt-install not found. Please run qemuinstall.sh first."
+    exit 1
+fi
+if virsh dominfo "$name" >/dev/null 2>&1; then
+    _red "VM '$name' already exists. Delete it first or choose another name."
+    exit 1
+fi
+if [[ -f "${images_path}/vm-${name}.qcow2" || -f "${images_path}/vm-${name}-cloudinit.iso" ]]; then
+    _red "VM disk or cloud-init ISO for '$name' already exists in $images_path"
     exit 1
 fi
 
@@ -672,25 +726,51 @@ fw_init_table() {
     fi
 }
 
+fw_delete_vm_rules() {
+    local vm_name="$1" vm_ip="${2:-}"
+    if [[ "$FW_BACKEND" == "nft" ]]; then
+        nft -a list chain ip qemu prerouting 2>/dev/null \
+            | grep "\"vm:${vm_name}\"" \
+            | grep -oP '# handle \K[0-9]+' \
+            | while read -r h; do
+                nft delete rule ip qemu prerouting handle "$h" 2>/dev/null || true
+            done
+    elif [[ "$FW_BACKEND" == "iptables" && -n "$vm_ip" ]]; then
+        while iptables -t nat -S PREROUTING 2>/dev/null | grep -Fq -- "--to-destination ${vm_ip}"; do
+            local rule
+            rule=$(iptables -t nat -S PREROUTING 2>/dev/null \
+                | grep -F -- "--to-destination ${vm_ip}" \
+                | head -1 \
+                | sed 's/^-A /-D /')
+            iptables -t nat $rule 2>/dev/null || break
+        done
+    fi
+}
+
 fw_add_vm() {
     local vm_name="$1" vm_ip="$2" ssh_port="$3" start_p="$4" end_p="$5"
     _yellow "Adding firewall rules for ${vm_name} (${FW_BACKEND})..."
+    fw_delete_vm_rules "$vm_name" "$vm_ip"
     if [[ "$FW_BACKEND" == "nft" ]]; then
         # SSH DNAT (single port → port 22)
-        nft add rule ip qemu prerouting tcp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\""
-        nft add rule ip qemu prerouting udp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\""
+        nft add rule ip qemu prerouting tcp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\"" 2>/dev/null || true
+        nft add rule ip qemu prerouting udp dport "$ssh_port" dnat to "${vm_ip}:22" comment "\"vm:${vm_name}\"" 2>/dev/null || true
         # Port range DNAT (identity mapping: keep original port)
-        if [[ "$start_p" -le "$end_p" ]]; then
-            nft add rule ip qemu prerouting tcp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\""
-            nft add rule ip qemu prerouting udp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\""
+        if (( 10#$start_p <= 10#$end_p )); then
+            nft add rule ip qemu prerouting tcp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\"" 2>/dev/null || true
+            nft add rule ip qemu prerouting udp dport "${start_p}-${end_p}" dnat to "${vm_ip}" comment "\"vm:${vm_name}\"" 2>/dev/null || true
         fi
     else
-        iptables -t nat -I PREROUTING -p tcp --dport "$ssh_port" -j DNAT --to "${vm_ip}:22"
-        iptables -t nat -I PREROUTING -p udp --dport "$ssh_port" -j DNAT --to "${vm_ip}:22"
-        for ((port=start_p; port<=end_p; port++)); do
-            iptables -t nat -I PREROUTING -p tcp --dport "$port" -j DNAT --to "${vm_ip}:${port}"
-            iptables -t nat -I PREROUTING -p udp --dport "$port" -j DNAT --to "${vm_ip}:${port}"
-        done
+        iptables -t nat -C PREROUTING -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22" 2>/dev/null || \
+            iptables -t nat -I PREROUTING -p tcp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22" 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p udp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22" 2>/dev/null || \
+            iptables -t nat -I PREROUTING -p udp --dport "$ssh_port" -j DNAT --to-destination "${vm_ip}:22" 2>/dev/null || true
+        if (( 10#$start_p <= 10#$end_p )); then
+            iptables -t nat -C PREROUTING -p tcp --dport "${start_p}:${end_p}" -j DNAT --to-destination "$vm_ip" 2>/dev/null || \
+                iptables -t nat -I PREROUTING -p tcp --dport "${start_p}:${end_p}" -j DNAT --to-destination "$vm_ip" 2>/dev/null || true
+            iptables -t nat -C PREROUTING -p udp --dport "${start_p}:${end_p}" -j DNAT --to-destination "$vm_ip" 2>/dev/null || \
+                iptables -t nat -I PREROUTING -p udp --dport "${start_p}:${end_p}" -j DNAT --to-destination "$vm_ip" 2>/dev/null || true
+        fi
     fi
     _green "  ✓ Port forwarding rules applied"
 }
@@ -715,6 +795,40 @@ fw_save() {
         # Trigger netfilter-persistent save (Debian/Ubuntu)
         netfilter-persistent save 2>/dev/null || true
     fi
+}
+
+remove_dhcp_reservation() {
+    local vm_name="$1" vm_mac="${2:-}" vm_ip="${3:-}"
+    local dhcp_mac="$vm_mac" dhcp_ip="$vm_ip"
+
+    if [[ -z "$dhcp_mac" || -z "$dhcp_ip" ]]; then
+        dhcp_mac=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "mac='[^']+'" | cut -d"'" -f2 | head -1 || true)
+        dhcp_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 | head -1 || true)
+    fi
+
+    if [[ -n "$dhcp_mac" && -n "$dhcp_ip" ]]; then
+        virsh net-update default delete ip-dhcp-host \
+            "<host mac='${dhcp_mac}' name='${vm_name}' ip='${dhcp_ip}' />" \
+            --live --config 2>/dev/null || \
+        virsh net-update default delete ip-dhcp-host \
+            "<host mac='${dhcp_mac}' name='${vm_name}' ip='${dhcp_ip}' />" \
+            --config 2>/dev/null || true
+    fi
+}
+
+cleanup_partial_vm() {
+    local vm_name="$1" vm_ip="${2:-}" vm_mac="${3:-}" vm_disk="${4:-}" ci_iso="${5:-}"
+    _yellow "Cleaning partial VM state for ${vm_name}..."
+    virsh destroy "$vm_name" 2>/dev/null || true
+    virsh undefine "$vm_name" --remove-all-storage 2>/dev/null || virsh undefine "$vm_name" 2>/dev/null || true
+    if [[ "$FW_BACKEND" == "nft" || "$FW_BACKEND" == "iptables" ]]; then
+        fw_delete_vm_rules "$vm_name" "$vm_ip"
+        fw_save
+    fi
+    remove_dhcp_reservation "$vm_name" "$vm_mac" "$vm_ip"
+    rm -f "$vm_disk" "$ci_iso" \
+        "/tmp/qemu-cloudinit-${vm_name}.yaml" \
+        "/tmp/qemu-cloudinit-${vm_name}-meta.yaml" 2>/dev/null || true
 }
 
 # ======== 检测公网 IP ========
@@ -818,7 +932,7 @@ spawn_readiness_daemon() {
                 continue
             fi
             # 检查 SSH 是否可用
-            if timeout 3 bash -c \"echo | nc -w2 ${vm_ip} 22\" >/dev/null 2>&1; then
+            if timeout 3 bash -c \": >/dev/tcp/${vm_ip}/22\" >/dev/null 2>&1; then
                 echo \"[\$(date)] VM ${vm_name} is ready! SSH available on ${vm_ip}:22\" >> \"${log_file}\"
                 echo \"[\$(date)] Done.\" >> \"${log_file}\"
                 exit 0
@@ -888,12 +1002,7 @@ main() {
     if [[ -n "$old_dhcp_mac" ]]; then
         old_dhcp_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 || true)
         _yellow "  Removing stale DHCP reservation: ${old_dhcp_mac} -> ${old_dhcp_ip}"
-        virsh net-update default delete ip-dhcp-host \
-            "<host mac='${old_dhcp_mac}' name='${name}' ip='${old_dhcp_ip}' />" \
-            --live --config 2>/dev/null || \
-        virsh net-update default delete ip-dhcp-host \
-            "<host mac='${old_dhcp_mac}' name='${name}' ip='${old_dhcp_ip}' />" \
-            --config 2>/dev/null || true
+        remove_dhcp_reservation "$name" "$old_dhcp_mac" "$old_dhcp_ip"
     fi
     virsh net-update default add ip-dhcp-host \
         "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
@@ -1062,8 +1171,7 @@ except:
 
     if [[ $virt_rc -ne 0 ]]; then
         _red "VM deployment failed"
-        virsh undefine "$name" 2>/dev/null || true
-        rm -f "$vm_disk" "$ci_iso" 2>/dev/null || true
+        cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "$vm_disk" "$ci_iso"
         exit 1
     fi
 

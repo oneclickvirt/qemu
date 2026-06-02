@@ -12,15 +12,22 @@ _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
 fi
 
 # 支持 -y / --force / --yes 跳过确认
-# 也支持环境变量：VM_NAME=<name>  QEMU_FORCE_DELETE=yes
+# 也支持环境变量：VM_NAME=<name>  QEMU_FORCE_DELETE=yes 或 noninteractive=true
 force_mode=false
-if [[ "${QEMU_FORCE_DELETE:-}" == "yes" || "${QEMU_FORCE_DELETE:-}" == "true" || "${QEMU_FORCE_DELETE:-}" == "1" ]]; then
+if is_truthy "${QEMU_FORCE_DELETE:-}" || is_truthy "${noninteractive:-}"; then
     force_mode=true
 fi
 vm_name="${VM_NAME:-}"
@@ -36,8 +43,8 @@ if [[ -z "$vm_name" ]]; then
     echo "当前虚拟机列表 / Current VMs:"
     virsh list --all 2>/dev/null
     echo ""
-    if [[ ! -t 0 ]]; then
-        _red "No VM name specified and stdin is not a terminal. Set VM_NAME env or pass name as argument."
+    if is_truthy "${noninteractive:-}" || [[ ! -t 0 ]]; then
+        _red "No VM name specified. Set VM_NAME env or pass name as argument."
         exit 1
     fi
     read -rp "$(echo -e "\033[32m请输入要删除的虚拟机名称 / Enter VM name to delete: \033[0m")" vm_name
@@ -56,6 +63,10 @@ fi
 
 _yellow "即将删除虚拟机 / About to delete VM: $vm_name"
 if [[ "$force_mode" != true ]]; then
+    if [[ ! -t 0 ]]; then
+        _red "Confirmation required. Set noninteractive=true or QEMU_FORCE_DELETE=yes to run without prompts."
+        exit 1
+    fi
     read -rp "$(echo -e "\033[31m确认删除？输入 yes 继续 / Confirm? (yes): \033[0m")" confirm
     if [[ "$confirm" != "yes" ]]; then
         _yellow "已取消 / Cancelled"
@@ -116,8 +127,8 @@ if [[ "$FW_BACKEND" == "nft" ]]; then
 elif [[ "$FW_BACKEND" == "iptables" ]]; then
     # iptables: 删除所有指向该 VM IP 的 DNAT/FORWARD 规则
     if [[ -n "$vm_ip" ]]; then
-        while iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT.*${vm_ip}[:/]"; do
-            rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT.*${vm_ip}[:/]" | head -1 | sed 's/^-A /-D /')
+        while iptables -t nat -S PREROUTING 2>/dev/null | grep -Fq -- "--to-destination ${vm_ip}"; do
+            rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "--to-destination ${vm_ip}" | head -1 | sed 's/^-A /-D /')
             iptables -t nat $rule 2>/dev/null || break
         done
         while iptables -S FORWARD 2>/dev/null | grep -q -- "-d ${vm_ip}"; do

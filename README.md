@@ -12,8 +12,18 @@
 - 使用官方 Cloud Image（qcow2 格式），自动下载并使用 cloud-init 初始化
 - 支持系统：Debian 10/11/12/13、Ubuntu 18/20/22/24、AlmaLinux 8/9、RockyLinux 8/9、OpenEuler 22
 - 支持架构：amd64、arm64
-- 网络模式：libvirt NAT（virbr0），通过 iptables 进行端口映射
+- 网络模式：libvirt NAT（virbr0），通过 nftables 或 iptables 进行端口映射
 - 虚拟机信息记录在 `/root/vmlog`
+
+## 无交互约定
+
+所有脚本统一支持以下方式进入无交互模式：
+
+```bash
+export noninteractive=true
+```
+
+开启后，脚本不会等待人工输入：安装和批量创建会使用默认值或已传入的参数；删除和卸载会把该变量视为明确确认。各脚本原有的专用环境变量（如 `VM_COUNT`、`QEMU_FORCE_DELETE`、`QEMU_FORCE_UNINSTALL`）仍然兼容。
 
 ## 安装 QEMU/KVM 环境
 
@@ -24,6 +34,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuin
 **支持环境变量（无交互）：**
 
 ```bash
+export noninteractive=true
 # 自定义镜像存储路径（默认 /var/lib/libvirt/images）
 export QEMU_IMAGES_PATH=/data/vm-images
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh)
@@ -90,6 +101,7 @@ chmod +x create_qemu.sh
 **支持环境变量（无交互一键批量创建）：**
 
 ```bash
+export noninteractive=true
 export VM_COUNT=3          # 虚拟机数量
 export VM_MEMORY=1024      # 每台内存 MB
 export VM_CPU=1            # 每台 CPU 核数
@@ -130,6 +142,7 @@ chmod +x delete_qemu.sh
 
 ```bash
 export VM_NAME=vm1
+export noninteractive=true
 export QEMU_FORCE_DELETE=yes
 ./delete_qemu.sh
 ```
@@ -150,6 +163,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuun
 
 ```bash
 # 方式一：环境变量
+export noninteractive=true
 export QEMU_FORCE_UNINSTALL=yes
 bash <(curl -sSL https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuuninstall.sh)
 
@@ -161,6 +175,7 @@ bash qemuuninstall.sh -y
 
 | 脚本 | 环境变量 | 说明 | 示例值 |
 |------|----------|------|--------|
+| 全部 | `noninteractive` | 统一无交互开关 | `true` |
 | `qemuinstall.sh` | `QEMU_IMAGES_PATH` | 镜像存储路径 | `/data/images` |
 | `qemuuninstall.sh` | `QEMU_FORCE_UNINSTALL` | 跳过卸载确认 | `yes` |
 | `create_qemu.sh` | `VM_COUNT` | 创建虚拟机数量 | `3` |
@@ -187,7 +202,7 @@ bash qemuuninstall.sh -y
 
 - 使用 libvirt 的 `default` NAT 网络（`virbr0`，`192.168.122.0/24`）
 - 虚拟机获得 `192.168.122.2`~`192.168.122.99` 范围内的静态 IP（通过 DHCP 预留）
-- 通过 `/etc/libvirt/hooks/qemu` + iptables DNAT 实现宿主机端口到虚拟机端口的映射
+- 通过 nftables 或 iptables DNAT 实现宿主机端口到虚拟机端口的映射
 - SSH 端口映射：`宿主机:sshport` → `vm_ip:22`
 - 额外端口映射：`宿主机:startport-endport` → `vm_ip:startport-endport`
 

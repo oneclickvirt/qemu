@@ -16,10 +16,23 @@ _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 export DEBIAN_FRONTEND=noninteractive
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_noninteractive() {
+    is_truthy "${noninteractive:-}" || [[ ! -t 0 ]]
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
 fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 # ======== 切换到 /root ========
 cd /root || exit 1
@@ -28,17 +41,23 @@ cd /root || exit 1
 pre_check() {
     if ! command -v virsh >/dev/null 2>&1; then
         _yellow "virsh not found, running qemuinstall.sh..."
+        local -a install_prefix=()
+        if is_noninteractive; then
+            install_prefix=(env noninteractive=true)
+        fi
         if [[ -f /root/qemuinstall.sh ]]; then
-            bash /root/qemuinstall.sh
+            "${install_prefix[@]}" bash /root/qemuinstall.sh
         else
-            bash <(curl -sL "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh")
+            "${install_prefix[@]}" bash <(curl -sL "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/qemu/main/qemuinstall.sh")
         fi
     fi
 
     # 查找 oneqemu.sh（优先同目录，再查 /root/scripts）
-    local script_dir
-    script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-    if [[ ! -f "${script_dir}/oneqemu.sh" ]] && [[ ! -f /root/scripts/oneqemu.sh ]]; then
+    local script_oneqemu=""
+    if [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/oneqemu.sh" ]]; then
+        script_oneqemu="${SCRIPT_DIR}/oneqemu.sh"
+    fi
+    if [[ -z "$script_oneqemu" && ! -f /root/scripts/oneqemu.sh ]]; then
         mkdir -p /root/scripts
         curl -sL --connect-timeout 10 --max-time 60 \
             "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/oneqemu.sh" \
@@ -123,6 +142,8 @@ build_new_vms() {
         new_nums="$cli_nums"
     elif [[ -n "${VM_COUNT:-}" && "${VM_COUNT}" =~ ^[0-9]+$ ]]; then
         new_nums="$VM_COUNT"
+    elif is_noninteractive; then
+        new_nums=1
     else
         reading "需要新增几个虚拟机？ (How many VMs to create?) [default: 1]: " new_nums
         [[ -z "$new_nums" || ! "$new_nums" =~ ^[0-9]+$ ]] && new_nums=1
@@ -132,6 +153,8 @@ build_new_vms() {
         memory_nums="$cli_memory"
     elif [[ -n "${VM_MEMORY:-}" && "${VM_MEMORY}" =~ ^[0-9]+$ ]]; then
         memory_nums="$VM_MEMORY"
+    elif is_noninteractive; then
+        memory_nums=1024
     else
         reading "每个虚拟机内存大小(MB) (Memory per VM in MB) [default: 1024]: " memory_nums
         [[ -z "$memory_nums" || ! "$memory_nums" =~ ^[0-9]+$ ]] && memory_nums=1024
@@ -141,6 +164,8 @@ build_new_vms() {
         cpu_nums="$cli_cpu"
     elif [[ -n "${VM_CPU:-}" && "${VM_CPU}" =~ ^[0-9]+$ ]]; then
         cpu_nums="$VM_CPU"
+    elif is_noninteractive; then
+        cpu_nums=1
     else
         reading "每个虚拟机 CPU 核数 (CPU cores per VM) [default: 1]: " cpu_nums
         [[ -z "$cpu_nums" || ! "$cpu_nums" =~ ^[0-9]+$ ]] && cpu_nums=1
@@ -150,6 +175,8 @@ build_new_vms() {
         disk_nums="$cli_disk"
     elif [[ -n "${VM_DISK:-}" && "${VM_DISK}" =~ ^[0-9]+$ ]]; then
         disk_nums="$VM_DISK"
+    elif is_noninteractive; then
+        disk_nums=20
     else
         reading "每个虚拟机磁盘大小(GB) (Disk size per VM in GB) [default: 20]: " disk_nums
         [[ -z "$disk_nums" || ! "$disk_nums" =~ ^[0-9]+$ ]] && disk_nums=20
@@ -159,6 +186,8 @@ build_new_vms() {
         system_type="$cli_system"
     elif [[ -n "${VM_SYSTEM:-}" ]]; then
         system_type="$VM_SYSTEM"
+    elif is_noninteractive; then
+        system_type="debian12"
     else
         _blue "支持的系统 / Supported systems:"
         _blue "  1. debian12 (default)  2. ubuntu22"
@@ -188,6 +217,18 @@ build_new_vms() {
         _yellow "Unknown system '${system_type}', using debian12"
         system_type="debian12"
     fi
+    new_nums=$((10#$new_nums))
+    memory_nums=$((10#$memory_nums))
+    cpu_nums=$((10#$cpu_nums))
+    disk_nums=$((10#$disk_nums))
+    if (( new_nums < 1 )); then
+        _red "VM count must be greater than 0"
+        exit 1
+    fi
+    if (( memory_nums < 1 || cpu_nums < 1 || disk_nums < 1 )); then
+        _red "Memory, CPU and disk values must be greater than 0"
+        exit 1
+    fi
 
     _blue "======================================================"
     _blue "  即将创建 $new_nums 个虚拟机"
@@ -196,12 +237,21 @@ build_new_vms() {
 
     local scripts_dir
     # 优先使用与 create_qemu.sh 同目录的 oneqemu.sh
-    if [[ -f "$(dirname "$0")/oneqemu.sh" ]]; then
-        scripts_dir="$(dirname "$0")"
+    if [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/oneqemu.sh" ]]; then
+        scripts_dir="$SCRIPT_DIR"
     elif [[ -f /root/scripts/oneqemu.sh ]]; then
         scripts_dir="/root/scripts"
     else
         scripts_dir="/root"
+    fi
+    local oneqemu_path="${scripts_dir}/oneqemu.sh"
+    if [[ ! -f "$oneqemu_path" ]]; then
+        _red "oneqemu.sh not found. Expected: $oneqemu_path"
+        exit 1
+    fi
+    local -a oneqemu_prefix=()
+    if is_noninteractive; then
+        oneqemu_prefix=(env noninteractive=true)
     fi
 
     for ((i = 1; i <= new_nums; i++)); do
@@ -218,7 +268,7 @@ build_new_vms() {
 
         _yellow "[${i}/${new_nums}] Creating VM: ${vm_name}  ssh:${ssh_port}  ports:${public_port_start}-${public_port_end}"
 
-        bash "${scripts_dir}/oneqemu.sh" \
+        "${oneqemu_prefix[@]}" bash "$oneqemu_path" \
             "$vm_name" \
             "$cpu_nums" \
             "$memory_nums" \
@@ -246,16 +296,7 @@ show_log() {
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" ]] && continue
             local n sshp pw cp mem dk sp ep sys ip
-            n=$(echo "$line"    | awk '{print $1}')
-            sshp=$(echo "$line" | awk '{print $2}')
-            pw=$(echo "$line"   | awk '{print $3}')
-            cp=$(echo "$line"   | awk '{print $4}')
-            mem=$(echo "$line"  | awk '{print $5}')
-            dk=$(echo "$line"   | awk '{print $6}')
-            sp=$(echo "$line"   | awk '{print $7}')
-            ep=$(echo "$line"   | awk '{print $8}')
-            sys=$(echo "$line"  | awk '{print $9}')
-            ip=$(echo "$line"   | awk '{print $10}')
+            read -r n sshp pw cp mem dk sp ep sys ip _ <<< "$line"
             printf "  %-12s %-8s %-12s %-4s %-8s %-6s %-14s %-10s %-6s\n" \
                 "$n" "$sshp" "$pw" "$cp" "$mem" "$dk" "${sp}-${ep}" "$sys" "$ip"
         done < "$log_file"

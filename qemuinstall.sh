@@ -10,6 +10,17 @@ _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 export DEBIAN_FRONTEND=noninteractive
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_noninteractive() {
+    is_truthy "${noninteractive:-}" || [[ ! -t 0 ]]
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
@@ -136,16 +147,16 @@ install_base_deps() {
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq dnsmasq-base genisoimage 2>/dev/null || true
+                socat unzip tar jq xz-utils dnsmasq-base genisoimage 2>/dev/null || true
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute \
-                socat unzip tar jq dnsmasq genisoimage 2>/dev/null || true
+                socat unzip tar jq xz dnsmasq genisoimage 2>/dev/null || true
             ;;
         Alpine)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq cdrkit 2>/dev/null || true
+                socat unzip tar jq xz cdrkit 2>/dev/null || true
             ;;
     esac
     _green "Base dependencies installed"
@@ -218,9 +229,10 @@ start_libvirtd() {
 # ======== 配置 libvirt 默认存储池 ========
 configure_storage_pool() {
     _yellow "Configuring default storage pool..."
-    mkdir -p /var/lib/libvirt/images
+    local pool_path="${qemu_images_path:-/var/lib/libvirt/images}"
+    mkdir -p "$pool_path"
     if ! virsh pool-info default >/dev/null 2>&1; then
-        virsh pool-define-as default dir --target /var/lib/libvirt/images 2>/dev/null || true
+        virsh pool-define-as default dir --target "$pool_path" 2>/dev/null || true
         virsh pool-start default 2>/dev/null || true
         virsh pool-autostart default 2>/dev/null || true
         _green "  ✓ Default storage pool created"
@@ -242,7 +254,7 @@ configure_default_network() {
         cat > /tmp/qemu-default-net.xml <<'NETEOF'
 <network>
   <name>default</name>
-  <forward mode='open'/>
+  <forward mode='nat'/>
   <bridge name='virbr0' stp='on' delay='0'/>
   <ip address='192.168.122.1' netmask='255.255.255.0'>
     <dhcp>
@@ -473,11 +485,11 @@ main() {
         _yellow "Using QEMU_IMAGES_PATH from environment: $qemu_images_path"
     elif [[ -n "$cli_images_path" ]]; then
         qemu_images_path="$cli_images_path"
-    elif [[ -t 0 ]]; then
-        reading "虚拟机镜像存储路径？（回车默认：/var/lib/libvirt/images）：" qemu_images_path
-    else
+    elif is_noninteractive; then
         _yellow "Non-interactive mode detected, using default images path"
         qemu_images_path=""
+    else
+        reading "虚拟机镜像存储路径？（回车默认：/var/lib/libvirt/images）：" qemu_images_path
     fi
     if [ -z "$qemu_images_path" ]; then
         qemu_images_path="/var/lib/libvirt/images"

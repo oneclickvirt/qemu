@@ -9,15 +9,22 @@ _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root"
     exit 1
 fi
 
 # 支持 -y / --force / --yes 跳过确认
-# 也支持环境变量：QEMU_FORCE_UNINSTALL=yes
+# 也支持环境变量：QEMU_FORCE_UNINSTALL=yes 或 noninteractive=true
 force_mode=false
-if [[ "${QEMU_FORCE_UNINSTALL:-}" == "yes" || "${QEMU_FORCE_UNINSTALL:-}" == "true" || "${QEMU_FORCE_UNINSTALL:-}" == "1" ]]; then
+if is_truthy "${QEMU_FORCE_UNINSTALL:-}" || is_truthy "${noninteractive:-}"; then
     force_mode=true
 fi
 for arg in "$@"; do
@@ -30,12 +37,16 @@ echo ""
 echo "======================================================"
 _red "  ⚠  警告：即将卸载 QEMU/KVM 全套环境"
 echo "  包含：所有运行中/停止的虚拟机、所有磁盘镜像、"
-echo "  所有 iptables 端口转发规则、libvirtd 服务、"
+echo "  所有 nftables/iptables 端口转发规则、libvirtd 服务、"
 echo "  以及相关软件包。"
 _red "  此操作不可逆！"
 echo "======================================================"
 echo ""
 if [[ "$force_mode" != true ]]; then
+    if [[ ! -t 0 ]]; then
+        _red "Confirmation required. Set noninteractive=true or QEMU_FORCE_UNINSTALL=yes to run without prompts."
+        exit 1
+    fi
     echo "请输入 yes 确认（其他输入取消）："
     read -rp "> " confirm
     if [[ "$confirm" != "yes" ]]; then

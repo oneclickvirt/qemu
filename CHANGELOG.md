@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## Unreleased
+
+- 统一支持 `noninteractive=true` 作为安装、创建、删除、卸载脚本的无交互开关。
+- 优化 iptables 端口范围映射，避免按端口逐条添加规则。
+- 增强虚拟机创建参数校验和失败清理，避免部署失败后残留 DHCP 预留、端口转发规则或临时磁盘。
+- 新建 libvirt 默认网络时使用 NAT 模式，并让默认存储池尊重自定义镜像路径。
+- 修复批量创建脚本在切换到 `/root` 后无法稳定优先使用同目录 `oneqemu.sh` 的问题。
+
 ## 2026.03.02
 
 - 初始化仓库，基于 oneclickvirt/containerd 实现 QEMU/KVM 版本
