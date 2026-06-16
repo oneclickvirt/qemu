@@ -27,6 +27,42 @@ is_noninteractive() {
     is_truthy "${noninteractive:-}" || [[ ! -t 0 ]]
 }
 
+BATCH_LOCK_DIR="/tmp/qemu-vm-batch.lock"
+BATCH_LOCK_PID_FILE="${BATCH_LOCK_DIR}/pid"
+batch_lock_acquired=false
+
+acquire_batch_lock() {
+    local timeout="${1:-600}" elapsed=0
+    while ! mkdir "$BATCH_LOCK_DIR" 2>/dev/null; do
+        if [[ -f "$BATCH_LOCK_PID_FILE" ]]; then
+            local old_pid
+            old_pid=$(cat "$BATCH_LOCK_PID_FILE" 2>/dev/null || true)
+            if [[ "$old_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+                rmdir "$BATCH_LOCK_DIR" 2>/dev/null || rm -rf "$BATCH_LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        if (( elapsed >= timeout )); then
+            _red "Failed to acquire batch creation lock after ${timeout}s"
+            exit 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    batch_lock_acquired=true
+    printf '%s\n' "$$" > "$BATCH_LOCK_PID_FILE" 2>/dev/null || true
+}
+
+release_batch_lock() {
+    if [[ "$batch_lock_acquired" == true ]]; then
+        rm -f "$BATCH_LOCK_PID_FILE" 2>/dev/null || true
+        rmdir "$BATCH_LOCK_DIR" 2>/dev/null || true
+        batch_lock_acquired=false
+    fi
+}
+
+trap release_batch_lock EXIT
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
@@ -72,7 +108,14 @@ cdn_success_url=""
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
+    local shuffled_cdn_urls=()
+    if command -v shuf >/dev/null 2>&1; then
+        while IFS= read -r cdn_url; do
+            shuffled_cdn_urls+=("$cdn_url")
+        done < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
+    else
+        shuffled_cdn_urls=("${cdn_urls[@]}")
+    fi
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -94,6 +137,40 @@ check_cdn_file() {
 
 check_cdn_file
 
+vm_db_file() {
+    if [[ -f /usr/local/bin/qemu_db_file ]]; then
+        cat /usr/local/bin/qemu_db_file
+    else
+        printf '%s\n' "/var/lib/libvirt/qemu-vms.db"
+    fi
+}
+
+apply_existing_vm_state() {
+    local existing_name="$1" existing_ssh="$2" existing_endport="$3"
+    local num_part
+    num_part=$(echo "$existing_name" | grep -oP '\d+$' || echo "0")
+    if [[ "$num_part" =~ ^[0-9]+$ ]] && (( 10#$num_part > vm_num )); then
+        vm_num=$((10#$num_part))
+    fi
+    if [[ "$existing_ssh" =~ ^[0-9]+$ ]] && (( 10#$existing_ssh > ssh_port )); then
+        ssh_port=$((10#$existing_ssh))
+    fi
+    if [[ "$existing_endport" =~ ^[0-9]+$ ]] && (( 10#$existing_endport > public_port_end )); then
+        public_port_end=$((10#$existing_endport))
+    fi
+}
+
+check_db_state() {
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    local db_file
+    db_file=$(vm_db_file)
+    [[ -f "$db_file" ]] || return 0
+    while IFS='|' read -r db_name db_ssh db_endport || [[ -n "$db_name" ]]; do
+        [[ -z "$db_name" ]] && continue
+        apply_existing_vm_state "$db_name" "$db_ssh" "$db_endport"
+    done < <(sqlite3 -separator '|' "$db_file" "SELECT vm_name, ssh_port, end_port FROM vms;" 2>/dev/null || true)
+}
+
 # ======== 读取日志，恢复编号状态 ========
 log_file="/root/vmlog"
 vm_prefix="vm"
@@ -103,29 +180,16 @@ public_port_end=35000
 
 check_log() {
     if [[ -f "$log_file" ]]; then
-        local last_line
-        last_line=$(tail -n 1 "$log_file" 2>/dev/null || true)
-        if [[ -n "$last_line" ]]; then
+        local line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
             # 格式: <name> <sshport> <password> <cpu> <memory> <disk> <startport> <endport> <system> <ip>
-            local last_name last_ssh last_endport
-            last_name=$(echo "$last_line" | awk '{print $1}')
-            last_ssh=$(echo "$last_line" | awk '{print $2}')
-            last_endport=$(echo "$last_line" | awk '{print $8}')
-
-            # 从日志名称提取编号
-            local num_part
-            num_part=$(echo "$last_name" | grep -oP '\d+$' || echo "0")
-            if [[ "$num_part" =~ ^[0-9]+$ ]]; then
-                vm_num="$num_part"
-            fi
-            if [[ "$last_ssh" =~ ^[0-9]+$ ]]; then
-                ssh_port="$last_ssh"
-            fi
-            if [[ "$last_endport" =~ ^[0-9]+$ ]]; then
-                public_port_end="$last_endport"
-            fi
-        fi
+            local existing_name existing_ssh _existing_pass _existing_cpu _existing_mem _existing_disk _existing_start existing_endport
+            read -r existing_name existing_ssh _existing_pass _existing_cpu _existing_mem _existing_disk _existing_start existing_endport _ <<< "$line"
+            apply_existing_vm_state "$existing_name" "$existing_ssh" "$existing_endport"
+        done < "$log_file"
     fi
+    check_db_state
 }
 
 # ======== 构建新虚拟机 ========
@@ -268,7 +332,7 @@ build_new_vms() {
 
         _yellow "[${i}/${new_nums}] Creating VM: ${vm_name}  ssh:${ssh_port}  ports:${public_port_start}-${public_port_end}"
 
-        "${oneqemu_prefix[@]}" bash "$oneqemu_path" \
+        if ! "${oneqemu_prefix[@]}" bash "$oneqemu_path" \
             "$vm_name" \
             "$cpu_nums" \
             "$memory_nums" \
@@ -277,7 +341,10 @@ build_new_vms() {
             "$ssh_port" \
             "$public_port_start" \
             "$public_port_end" \
-            "$system_type"
+            "$system_type"; then
+            _red "Failed to create VM '${vm_name}', stopping batch creation."
+            exit 1
+        fi
 
         echo ""
     done
@@ -289,7 +356,6 @@ show_log() {
         _blue "======================================================"
         _blue "  已有虚拟机记录 / Existing VM log:"
         _blue "======================================================"
-        local header
         printf "  %-12s %-8s %-12s %-4s %-8s %-6s %-14s %-10s %-6s\n" \
             "名称" "SSH端口" "密码" "CPU" "内存(MB)" "磁盘(GB)" "端口范围" "系统" "内网IP"
         echo "  ----------------------------------------------------------------------------"
@@ -301,11 +367,28 @@ show_log() {
                 "$n" "$sshp" "$pw" "$cp" "$mem" "$dk" "${sp}-${ep}" "$sys" "$ip"
         done < "$log_file"
         echo ""
+    elif command -v sqlite3 >/dev/null 2>&1; then
+        local db_file
+        db_file=$(vm_db_file)
+        [[ -f "$db_file" ]] || return 0
+        _blue "======================================================"
+        _blue "  已有虚拟机记录 / Existing VM database records:"
+        _blue "======================================================"
+        printf "  %-12s %-8s %-12s %-4s %-8s %-6s %-14s %-10s %-6s\n" \
+            "名称" "SSH端口" "密码" "CPU" "内存(MB)" "磁盘(GB)" "端口范围" "系统" "内网IP"
+        echo "  ----------------------------------------------------------------------------"
+        while IFS='|' read -r n sshp pw cp mem dk sp ep sys ip || [[ -n "$n" ]]; do
+            [[ -z "$n" ]] && continue
+            printf "  %-12s %-8s %-12s %-4s %-8s %-6s %-14s %-10s %-6s\n" \
+                "$n" "$sshp" "$pw" "$cp" "$mem" "$dk" "${sp}-${ep}" "$sys" "$ip"
+        done < <(sqlite3 -separator '|' "$db_file" "SELECT vm_name, ssh_port, password, cpu, memory, disk, start_port, end_port, system, ipv4 FROM vms ORDER BY id;" 2>/dev/null || true)
+        echo ""
     fi
 }
 
 # ======== 主流程 ========
 main() {
+    acquire_batch_lock 600
     pre_check
     check_log
     show_log

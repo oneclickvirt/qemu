@@ -29,6 +29,11 @@ if [ ! -d /usr/local/bin ]; then
     mkdir -p /usr/local/bin
 fi
 
+QEMU_IPV6_SUBNET="fd42:122::/64"
+QEMU_IPV6_GATEWAY="fd42:122::1"
+QEMU_IPV6_DHCP_START="fd42:122::100"
+QEMU_IPV6_DHCP_END="fd42:122::1ff"
+
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
@@ -97,7 +102,14 @@ cdn_success_url=""
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
+    local shuffled_cdn_urls=()
+    if command -v shuf >/dev/null 2>&1; then
+        while IFS= read -r cdn_url; do
+            shuffled_cdn_urls+=("$cdn_url")
+        done < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
+    else
+        shuffled_cdn_urls=("${cdn_urls[@]}")
+    fi
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -115,6 +127,10 @@ check_cdn_file() {
     else
         _yellow "No CDN available, using direct connection"
     fi
+}
+
+host_has_ipv6_default_route() {
+    ip -6 route show default 2>/dev/null | grep -q .
 }
 
 # ======== KVM 虚拟化支持检测 ========
@@ -250,8 +266,23 @@ configure_default_network() {
     _yellow "Configuring default NAT network..."
     # 检查 default 网络是否存在
     if ! virsh net-info default >/dev/null 2>&1; then
+        if ip link show virbr0 >/dev/null 2>&1; then
+            local bridge_is_libvirt=false net
+            while IFS= read -r net; do
+                [[ -z "$net" ]] && continue
+                if virsh net-dumpxml "$net" 2>/dev/null | grep -Eq "<bridge[[:space:]][^>]*name=['\"]virbr0['\"]"; then
+                    bridge_is_libvirt=true
+                    break
+                fi
+            done < <(virsh net-list --all --name 2>/dev/null)
+            if [[ "$bridge_is_libvirt" != true ]]; then
+                _red "Bridge virbr0 already exists but is not managed by libvirt."
+                _red "Please rename/remove the existing bridge or configure libvirt manually before continuing."
+                exit 1
+            fi
+        fi
         # 创建默认网络 XML
-        cat > /tmp/qemu-default-net.xml <<'NETEOF'
+        cat > /tmp/qemu-default-net.xml <<NETEOF
 <network>
   <name>default</name>
   <forward mode='nat'/>
@@ -259,6 +290,11 @@ configure_default_network() {
   <ip address='192.168.122.1' netmask='255.255.255.0'>
     <dhcp>
       <range start='192.168.122.100' end='192.168.122.254'/>
+    </dhcp>
+  </ip>
+  <ip family='ipv6' address='${QEMU_IPV6_GATEWAY}' prefix='64'>
+    <dhcp>
+      <range start='${QEMU_IPV6_DHCP_START}' end='${QEMU_IPV6_DHCP_END}'/>
     </dhcp>
   </ip>
 </network>
@@ -302,6 +338,11 @@ HOOKEOF
 # ======== 配置防火墙 ========
 configure_firewall() {
     _yellow "Configuring firewall rules..."
+    local ipv6_nat_enabled=false
+    if host_has_ipv6_default_route; then
+        ipv6_nat_enabled=true
+    fi
+    echo "$ipv6_nat_enabled" > /usr/local/bin/qemu_ipv6_nat_enabled
     if command -v nft >/dev/null 2>&1; then
         echo "nft" > /usr/local/bin/qemu_fw_backend
         _green "  Using nftables backend"
@@ -319,6 +360,19 @@ configure_firewall() {
             nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
             nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
         fi
+        if [[ "$ipv6_nat_enabled" == true ]]; then
+            nft add table ip6 qemu6 2>/dev/null || true
+            nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+            nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            if ! nft list chain ip6 qemu6 postrouting 2>/dev/null | grep -q masquerade; then
+                nft add rule ip6 qemu6 postrouting ip6 saddr "$QEMU_IPV6_SUBNET" ip6 daddr != "$QEMU_IPV6_SUBNET" masquerade 2>/dev/null || true
+            fi
+            if ! nft list chain ip6 qemu6 forward 2>/dev/null | grep -q "ct state"; then
+                nft add rule ip6 qemu6 forward ct state established,related accept 2>/dev/null || true
+                nft add rule ip6 qemu6 forward ip6 daddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
+                nft add rule ip6 qemu6 forward ip6 saddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
+            fi
+        fi
         # Persist nft rules
         mkdir -p /etc/nftables.d
         {
@@ -326,9 +380,16 @@ configure_firewall() {
             echo "table ip qemu"
             echo "delete table ip qemu"
             nft list table ip qemu
+            if [[ "$ipv6_nat_enabled" == true ]]; then
+                echo "table ip6 qemu6"
+                echo "delete table ip6 qemu6"
+                nft list table ip6 qemu6
+            fi
         } > /etc/nftables.d/qemu.nft
-        if [[ -f /etc/nftables.conf ]] && ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
-            echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
+        if [[ -f /etc/nftables.conf ]] \
+            && ! grep -qF 'include "/etc/nftables.d/qemu.nft"' /etc/nftables.conf 2>/dev/null \
+            && ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
+            echo 'include "/etc/nftables.d/qemu.nft"' >> /etc/nftables.conf
         fi
         systemctl enable nftables 2>/dev/null || true
         _green "  ✓ nftables qemu table initialized"
@@ -344,6 +405,16 @@ configure_firewall() {
             iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
             iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+        if [[ "$ipv6_nat_enabled" == true ]] && command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -t nat -C POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || \
+                ip6tables -t nat -I POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || true
+            ip6tables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            ip6tables -C FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
+            ip6tables -C FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
+        fi
         
         # Install persistence tools
         if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
@@ -406,6 +477,11 @@ check_ipv6() {
         echo "false" > /usr/local/bin/qemu_ipv6_enabled
         _yellow "  IPv6 not detected"
     fi
+    if [[ -f /usr/local/bin/qemu_ipv6_nat_enabled ]] && grep -q '^true$' /usr/local/bin/qemu_ipv6_nat_enabled 2>/dev/null; then
+        _green "  ✓ IPv6 NAT enabled for ${QEMU_IPV6_SUBNET}"
+    else
+        _yellow "  IPv6 NAT disabled (no IPv6 default route detected)"
+    fi
 }
 
 # ======== 初始化 SQLite 数据库 ========
@@ -416,12 +492,18 @@ init_database() {
         _yellow "  sqlite3 not available, skipping database init"
         return 0
     fi
-    sqlite3 "$db_file" <<'SQLEOF'
+    mkdir -p "$(dirname "$db_file")"
+    if ! sqlite3 "$db_file" <<'SQLEOF' >/dev/null 2>&1
+PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS vms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vm_name TEXT UNIQUE,
+    vm_name TEXT UNIQUE NOT NULL,
     ipv4 TEXT,
+    ipv6 TEXT,
     mac TEXT,
+    bridge TEXT,
+    fw_backend TEXT,
+    ipv6_nat INTEGER DEFAULT 0,
     ssh_port INTEGER,
     start_port INTEGER,
     end_port INTEGER,
@@ -430,9 +512,28 @@ CREATE TABLE IF NOT EXISTS vms (
     disk INTEGER,
     system TEXT,
     password TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_vms_ports ON vms(ssh_port, start_port, end_port);
+CREATE INDEX IF NOT EXISTS idx_vms_ipv4 ON vms(ipv4);
 SQLEOF
+    then
+        _yellow "  SQLite database init failed, continuing without structured VM database"
+        return 0
+    fi
+    local column
+    for column in \
+        "ipv6 TEXT" \
+        "bridge TEXT" \
+        "fw_backend TEXT" \
+        "ipv6_nat INTEGER DEFAULT 0" \
+        "updated_at DATETIME"; do
+        local column_name="${column%% *}"
+        if ! sqlite3 "$db_file" "PRAGMA table_info(vms);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx "$column_name"; then
+            sqlite3 "$db_file" "ALTER TABLE vms ADD COLUMN ${column};" 2>/dev/null || true
+        fi
+    done
     echo "$db_file" > /usr/local/bin/qemu_db_file
     _green "  ✓ VM database initialized: $db_file"
 }
@@ -529,6 +630,7 @@ main() {
     _green "======================================================"
     _green "  ✓ QEMU/KVM 安装完成！"
     _green "======================================================"
+    _yellow "  防火墙后端:     $fw_info"
     echo
     _blue "常用命令:"
     _yellow "  查看所有虚拟机:  virsh list --all"

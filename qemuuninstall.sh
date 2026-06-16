@@ -87,10 +87,14 @@ _blue "[2/9] 清理防火墙规则..."
 # 清理 nftables qemu 表
 if command -v nft >/dev/null 2>&1; then
     nft delete table ip qemu 2>/dev/null || true
+    nft delete table ip6 qemu6 2>/dev/null || true
     rm -f /etc/nftables.d/qemu.nft 2>/dev/null || true
     # 移除 nftables.conf 中的 include 指令
     if [[ -f /etc/nftables.conf ]]; then
-        sed -i '/include "\/etc\/nftables.d\/\*\.nft"/d' /etc/nftables.conf 2>/dev/null || true
+        sed -i '/include "\/etc\/nftables.d\/qemu\.nft"/d' /etc/nftables.conf 2>/dev/null || true
+        if ! find /etc/nftables.d -maxdepth 1 -type f -name '*.nft' 2>/dev/null | grep -q .; then
+            sed -i '/include "\/etc\/nftables.d\/\*\.nft"/d' /etc/nftables.conf 2>/dev/null || true
+        fi
     fi
     _green "  nftables qemu 表已清理"
 fi
@@ -100,7 +104,8 @@ if command -v iptables >/dev/null 2>&1; then
     # 清理 PREROUTING 中指向 192.168.122.x 的 DNAT 规则
     while iptables -t nat -S PREROUTING 2>/dev/null | grep -q "DNAT.*192\.168\.122\."; do
         rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "DNAT.*192\.168\.122\." | head -1 | sed 's/^-A /-D /')
-        iptables -t nat $rule 2>/dev/null || break
+        read -r -a rule_args <<< "$rule"
+        iptables -t nat "${rule_args[@]}" 2>/dev/null || break
     done
     # 清理 POSTROUTING MASQUERADE
     iptables -t nat -D POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
@@ -114,6 +119,18 @@ if command -v iptables >/dev/null 2>&1; then
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
     service iptables save 2>/dev/null || true
+    service ip6tables save 2>/dev/null || true
+    netfilter-persistent save 2>/dev/null || true
+fi
+
+if command -v ip6tables >/dev/null 2>&1; then
+    qemu_ipv6_subnet="fd42:122::/64"
+    ip6tables -t nat -D POSTROUTING -s "$qemu_ipv6_subnet" ! -d "$qemu_ipv6_subnet" -j MASQUERADE 2>/dev/null || true
+    ip6tables -D FORWARD -d "$qemu_ipv6_subnet" -j ACCEPT 2>/dev/null || true
+    ip6tables -D FORWARD -s "$qemu_ipv6_subnet" -j ACCEPT 2>/dev/null || true
+    ip6tables -D FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    mkdir -p /etc/iptables
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
     service ip6tables save 2>/dev/null || true
     netfilter-persistent save 2>/dev/null || true
 fi
@@ -221,10 +238,13 @@ for f in \
     /usr/local/bin/qemu_images_path \
     /usr/local/bin/qemu_bridge \
     /usr/local/bin/qemu_ipv6_enabled \
+    /usr/local/bin/qemu_ipv6_nat_enabled \
     /usr/local/bin/qemu_main_interface \
     /usr/local/bin/qemu_db_file \
     /usr/local/bin/qemu_fw_backend \
     /var/lib/libvirt/qemu-vms.db \
+    /var/lib/libvirt/qemu-vms.db-wal \
+    /var/lib/libvirt/qemu-vms.db-shm \
     /root/vmlog; do
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
 done
@@ -232,6 +252,8 @@ done
 rm -f /tmp/qemu-cloudinit*.yaml /tmp/qemu-cloudinit*.iso 2>/dev/null || true
 rm -f /tmp/qemu-init-*.log 2>/dev/null || true
 rm -f /tmp/qemu-ci-* 2>/dev/null || true
+rm -f /tmp/qemu-vm-reservations 2>/dev/null || true
+rm -rf /tmp/qemu-vm-state.lock /tmp/qemu-vm-batch.lock 2>/dev/null || true
 _green "  状态文件已清理"
 
 # ======== 9. 清理 sysctl 配置 ========

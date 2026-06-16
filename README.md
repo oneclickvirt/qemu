@@ -12,7 +12,7 @@
 - 使用官方 Cloud Image（qcow2 格式），自动下载并使用 cloud-init 初始化
 - 支持系统：Debian 10/11/12/13、Ubuntu 18/20/22/24、AlmaLinux 8/9、RockyLinux 8/9、OpenEuler 22
 - 支持架构：amd64、arm64
-- 网络模式：libvirt NAT（virbr0），通过 nftables 或 iptables 进行端口映射
+- 网络模式：libvirt NAT（virbr0），通过 nftables 或 iptables 进行端口映射；新安装网络支持 ULA IPv6 NAT
 - 虚拟机信息记录在 `/root/vmlog`
 
 ## 无交互约定
@@ -63,7 +63,7 @@ chmod +x oneqemu.sh
 | cpu | CPU 核数 | 1 |
 | memory_mb | 内存限制（MB） | 1024 |
 | disk_gb | 磁盘大小（GB） | 20 |
-| password | root 密码 | 123456 |
+| password | root 密码 | 自动生成 |
 | sshport | 宿主机 SSH 映射端口 | 25001 |
 | startport | 额外端口范围起始 | 35001 |
 | endport | 额外端口范围结束 | 35025 |
@@ -81,6 +81,22 @@ chmod +x oneqemu.sh
 
 > system 名称不区分大小写，支持带 `-` 或 `_` 分隔符（如 `debian-13`、`ubuntu_22`），均可自动规范化。
 
+**单机创建也支持环境变量（位置参数优先）：**
+
+```bash
+export noninteractive=true
+export VM_NAME=vm1
+export VM_CPU=1
+export VM_MEMORY=1024
+export VM_DISK=20
+export VM_PASSWORD='ChangeMe-123'
+export VM_SSH_PORT=25001
+export VM_START_PORT=35001
+export VM_END_PORT=35025
+export VM_SYSTEM=debian12
+./oneqemu.sh
+```
+
 ## 批量开设虚拟机
 
 ```bash
@@ -90,6 +106,7 @@ chmod +x create_qemu.sh
 ```
 
 交互式脚本，自动递增虚拟机名（vm1, vm2, ...）、SSH 端口、公网端口，虚拟机信息记录到 `vmlog` 文件。
+批量创建会使用批处理锁串行执行；若单台创建失败，脚本会停止后续创建，避免名称和端口继续漂移。
 
 **支持命令行参数（非交互）：**
 
@@ -110,7 +127,7 @@ export VM_SYSTEM=debian12  # 操作系统类型
 ./create_qemu.sh
 ```
 
-> **说明：** 脚本不会阻塞等待 cloud-init 完成。DHCP 预留和端口转发规则在 VM 启动前已配置完毕，cloud-init 在后台运行；初始化完成（密码设置、SSH 配置等）后 VM 自动关机并重启。可通过以下命令查看初始化进度：
+> **说明：** 脚本不会阻塞等待 cloud-init 完成。DHCP 预留和端口转发规则在 VM 启动前已配置完毕，cloud-init 在后台运行；VM 保持运行，SSH 就绪后即可连接。可通过以下命令查看初始化进度：
 > ```bash
 > tail -f /tmp/qemu-init-<vm_name>.log
 > ```
@@ -126,6 +143,23 @@ virsh destroy <name>                # 强制关闭虚拟机
 virsh reboot <name>                 # 重启虚拟机
 virsh dominfo <name>                # 查看虚拟机信息
 virsh domifaddr <name>              # 查看虚拟机 IP 地址
+```
+
+也可以使用项目脚本进行无交互管理：
+
+```bash
+curl -sSL -o manage_qemu.sh https://raw.githubusercontent.com/oneclickvirt/qemu/main/scripts/manage_qemu.sh
+chmod +x manage_qemu.sh
+
+# 查询全部或单台虚拟机（包含 vmlog、状态、MAC、IP、端口等信息）
+./manage_qemu.sh info all
+./manage_qemu.sh info vm1
+
+# 创建快照
+./manage_qemu.sh snapshot vm1 before-upgrade
+
+# 调整 CPU 和内存（内存单位 MB）
+./manage_qemu.sh set-resources vm1 2 2048
 ```
 
 ## 删除单个虚拟机
@@ -147,7 +181,8 @@ export QEMU_FORCE_DELETE=yes
 ./delete_qemu.sh
 ```
 
-脚本会自动清理：虚拟机定义、磁盘镜像、DHCP 预留、iptables 端口转发规则、日志记录。
+脚本会自动清理：虚拟机定义、磁盘镜像、DHCP 预留、nftables/iptables 端口转发规则、日志记录。
+删除成功后会同步清理 `/root/vmlog` 和本地 SQLite 状态库中的 VM 记录。
 
 ## 卸载（完整清理）
 
@@ -178,6 +213,15 @@ bash qemuuninstall.sh -y
 | 全部 | `noninteractive` | 统一无交互开关 | `true` |
 | `qemuinstall.sh` | `QEMU_IMAGES_PATH` | 镜像存储路径 | `/data/images` |
 | `qemuuninstall.sh` | `QEMU_FORCE_UNINSTALL` | 跳过卸载确认 | `yes` |
+| `oneqemu.sh` | `VM_NAME` | 虚拟机名称 | `vm1` |
+| `oneqemu.sh` | `VM_CPU` | CPU 核数 | `1` |
+| `oneqemu.sh` | `VM_MEMORY` | 内存（MB） | `1024` |
+| `oneqemu.sh` | `VM_DISK` | 磁盘（GB） | `20` |
+| `oneqemu.sh` | `VM_PASSWORD` | root 密码（为空则自动生成） | `ChangeMe-123` |
+| `oneqemu.sh` | `VM_SSH_PORT` | SSH 映射端口 | `25001` |
+| `oneqemu.sh` | `VM_START_PORT` | 额外端口起始 | `35001` |
+| `oneqemu.sh` | `VM_END_PORT` | 额外端口结束 | `35025` |
+| `oneqemu.sh` | `VM_SYSTEM` | 操作系统类型 | `debian12` |
 | `create_qemu.sh` | `VM_COUNT` | 创建虚拟机数量 | `3` |
 | `create_qemu.sh` | `VM_MEMORY` | 每台内存（MB） | `1024` |
 | `create_qemu.sh` | `VM_CPU` | 每台 CPU 核数 | `1` |
@@ -188,7 +232,7 @@ bash qemuuninstall.sh -y
 
 ## 镜像说明
 
-本项目使用各发行版官方 Cloud Image（cloud-init 格式），首次使用时自动下载至 `/var/lib/libvirt/images/`，后续创建同系统虚拟机不再重复下载：
+本项目使用各发行版官方 Cloud Image（cloud-init 格式），首次使用时自动下载至 `/var/lib/libvirt/images/`，后续创建同系统虚拟机不再重复下载。下载成功后会生成本地 `.sha256` 校验记录；再次使用缓存时会先复核 SHA256，校验失败则删除旧缓存并重新下载。
 
 | 系统 | 镜像来源 |
 |------|---------|
@@ -201,14 +245,17 @@ bash qemuuninstall.sh -y
 ## 网络说明
 
 - 使用 libvirt 的 `default` NAT 网络（`virbr0`，`192.168.122.0/24`）
+- 安装时会检测已有 `virbr0` 是否由 libvirt 管理，避免和宿主机已有网桥冲突
 - 虚拟机获得 `192.168.122.2`~`192.168.122.99` 范围内的静态 IP（通过 DHCP 预留）
 - 通过 nftables 或 iptables DNAT 实现宿主机端口到虚拟机端口的映射
+- 新安装的 default 网络包含 `fd42:122::/64` ULA IPv6 段；宿主机存在 IPv6 默认路由时会启用 NAT66，并记录 `ipv6_nat=true`
+- 创建中会临时预留 VM 名称、SSH 端口和额外端口范围，避免并发创建时复用同一资源
 - SSH 端口映射：`宿主机:sshport` → `vm_ip:22`
 - 额外端口映射：`宿主机:startport-endport` → `vm_ip:startport-endport`
 
 ## 日志文件
 
-虚拟机信息保存在 `/root/vmlog`，格式如下：
+虚拟机信息保存在 `/root/vmlog`，并同步写入 `/var/lib/libvirt/qemu-vms.db` 作为结构化本地状态库。`/root/vmlog` 保持向后兼容，格式如下：
 
 ```
 vm1 25001 passwd123 1 1024 20 35001 35025 debian 192.168.122.2
@@ -216,6 +263,14 @@ vm2 25002 passwd456 1 1024 20 35026 35050 ubuntu 192.168.122.3
 ```
 
 字段顺序：`名称 SSH端口 密码 CPU核数 内存MB 磁盘GB 起始端口 结束端口 系统 内网IP`
+
+新版本会在上述 10 个兼容字段后追加网络元数据，例如：
+
+```
+mac=52:54:xx:xx:xx:xx bridge=virbr0 fw=nft ipv6=fd42:122::2 ipv6_nat=true
+```
+
+创建、删除和 `manage_qemu.sh set-resources` 会同步维护 vmlog 与 SQLite 记录；若 vmlog 缺失，`manage_qemu.sh info all` 会回退读取 SQLite。
 
 ## 资源要求
 

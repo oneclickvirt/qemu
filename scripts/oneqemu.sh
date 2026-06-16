@@ -28,20 +28,202 @@ is_port() {
     is_uint "$1" && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
+generate_password() {
+    local seed hash
+    seed="$(date +%s%N)-${RANDOM}-${RANDOM}-${RANDOM}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash=$(printf '%s' "$seed" | sha256sum | awk '{print $1}')
+    elif command -v md5sum >/dev/null 2>&1; then
+        hash=$(printf '%s' "$seed" | md5sum | awk '{print $1}')
+    else
+        hash="${seed//[^a-zA-Z0-9]/}"
+    fi
+    printf '%s\n' "${hash:0:20}"
+}
+
+LOCK_DIR="/tmp/qemu-vm-state.lock"
+LOCK_PID_FILE="${LOCK_DIR}/pid"
+RESERVATION_FILE="/tmp/qemu-vm-reservations"
+QEMU_IPV6_SUBNET="fd42:122::/64"
+QEMU_IPV6_PREFIX="fd42:122::"
+lock_acquired=false
+state_lock_depth=0
+
+acquire_state_lock() {
+    local timeout="${1:-60}" elapsed=0
+    if [[ "$lock_acquired" == true ]]; then
+        state_lock_depth=$((state_lock_depth + 1))
+        return 0
+    fi
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [[ -f "$LOCK_PID_FILE" ]]; then
+            local old_pid
+            old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null || true)
+            if [[ "$old_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+                rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        if (( elapsed >= timeout )); then
+            _red "Failed to acquire VM state lock after ${timeout}s"
+            exit 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    lock_acquired=true
+    state_lock_depth=1
+    printf '%s\n' "$$" > "$LOCK_PID_FILE" 2>/dev/null || true
+}
+
+release_state_lock() {
+    if [[ "$lock_acquired" == true ]]; then
+        if (( state_lock_depth > 1 )); then
+            state_lock_depth=$((state_lock_depth - 1))
+            return 0
+        fi
+        rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        lock_acquired=false
+        state_lock_depth=0
+    fi
+}
+
+trap release_state_lock EXIT
+
+range_overlaps() {
+    local a_start="$1" a_end="$2" b_start="$3" b_end="$4"
+    (( 10#$a_start <= 10#$b_end && 10#$b_start <= 10#$a_end ))
+}
+
+prune_state_reservations() {
+    [[ -f "$RESERVATION_FILE" ]] || return 0
+    local tmpfile
+    tmpfile=$(mktemp) || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        local r_name r_ssh r_start r_end _r_ip _r_mac r_pid
+        read -r r_name r_ssh r_start r_end _r_ip _r_mac r_pid _ <<< "$line"
+        if [[ "$r_pid" =~ ^[0-9]+$ ]] && kill -0 "$r_pid" 2>/dev/null; then
+            printf '%s\n' "$line" >> "$tmpfile"
+        fi
+    done < "$RESERVATION_FILE"
+    mv "$tmpfile" "$RESERVATION_FILE"
+}
+
+ports_overlap_existing() {
+    local new_ssh="$1" new_start="$2" new_end="$3" old_ssh="$4" old_start="$5" old_end="$6"
+    [[ "$old_ssh" =~ ^[0-9]+$ && "$old_start" =~ ^[0-9]+$ && "$old_end" =~ ^[0-9]+$ ]] || return 1
+    range_overlaps "$new_ssh" "$new_ssh" "$old_ssh" "$old_ssh" || \
+        range_overlaps "$new_ssh" "$new_ssh" "$old_start" "$old_end" || \
+        range_overlaps "$new_start" "$new_end" "$old_ssh" "$old_ssh" || \
+        range_overlaps "$new_start" "$new_end" "$old_start" "$old_end"
+}
+
+state_conflict_message=""
+check_state_conflicts() {
+    local new_name="$1" new_ssh="$2" new_start="$3" new_end="$4"
+    state_conflict_message=""
+
+    if [[ -f /root/vmlog ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
+            local logged_name logged_ssh _logged_pass _logged_cpu _logged_mem _logged_disk logged_start logged_end
+            read -r logged_name logged_ssh _logged_pass _logged_cpu _logged_mem _logged_disk logged_start logged_end _ <<< "$line"
+            [[ "$logged_name" == "$new_name" ]] && continue
+            if ports_overlap_existing "$new_ssh" "$new_start" "$new_end" "$logged_ssh" "$logged_start" "$logged_end"; then
+                state_conflict_message="Requested ports overlap existing VM '${logged_name}' in /root/vmlog"
+                return 1
+            fi
+        done < /root/vmlog
+    fi
+
+    if command -v sqlite3 >/dev/null 2>&1; then
+        local db_file
+        db_file=$(vm_db_file)
+        if [[ -f "$db_file" ]]; then
+            while IFS='|' read -r db_name db_ssh db_start db_end || [[ -n "$db_name" ]]; do
+                [[ -z "$db_name" || "$db_name" == "$new_name" ]] && continue
+                if ports_overlap_existing "$new_ssh" "$new_start" "$new_end" "$db_ssh" "$db_start" "$db_end"; then
+                    state_conflict_message="Requested ports overlap existing VM '${db_name}' in SQLite VM database"
+                    return 1
+                fi
+            done < <(sqlite3 -separator '|' "$db_file" "SELECT vm_name, ssh_port, start_port, end_port FROM vms;" 2>/dev/null || true)
+        fi
+    fi
+
+    prune_state_reservations
+    if [[ -f "$RESERVATION_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
+            local r_name r_ssh r_start r_end _r_ip _r_mac r_pid
+            read -r r_name r_ssh r_start r_end _r_ip _r_mac r_pid _ <<< "$line"
+            [[ "$r_pid" == "$$" ]] && continue
+            if [[ "$r_name" == "$new_name" ]]; then
+                state_conflict_message="VM name '${new_name}' is already reserved by another creation process"
+                return 1
+            fi
+            if ports_overlap_existing "$new_ssh" "$new_start" "$new_end" "$r_ssh" "$r_start" "$r_end"; then
+                state_conflict_message="Requested ports overlap in-progress VM '${r_name}'"
+                return 1
+            fi
+        done < "$RESERVATION_FILE"
+    fi
+    return 0
+}
+
+add_state_reservation() {
+    local vm_name="$1" ssh_port="$2" start_p="$3" end_p="$4" ip_addr="$5" mac_addr="$6"
+    printf '%s %s %s %s %s %s %s\n' "$vm_name" "$ssh_port" "$start_p" "$end_p" "$ip_addr" "$mac_addr" "$$" >> "$RESERVATION_FILE"
+}
+
+remove_state_reservation() {
+    local vm_name="$1"
+    [[ -f "$RESERVATION_FILE" ]] || return 0
+    local tmpfile
+    tmpfile=$(mktemp) || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        local r_name _r_ssh _r_start _r_end _r_ip _r_mac r_pid
+        read -r r_name _r_ssh _r_start _r_end _r_ip _r_mac r_pid _ <<< "$line"
+        if [[ "$r_name" != "$vm_name" && "$r_pid" != "$$" ]]; then
+            printf '%s\n' "$line" >> "$tmpfile"
+        fi
+    done < "$RESERVATION_FILE"
+    mv "$tmpfile" "$RESERVATION_FILE"
+}
+
+is_ipv6_nat_enabled() {
+    [[ -f /usr/local/bin/qemu_ipv6_nat_enabled ]] && grep -q '^true$' /usr/local/bin/qemu_ipv6_nat_enabled 2>/dev/null
+}
+
+vm_expected_ipv6() {
+    local ipv4="$1" last_octet
+    last_octet="${ipv4##*.}"
+    if [[ "$last_octet" =~ ^[0-9]+$ ]]; then
+        printf '%s%x\n' "$QEMU_IPV6_PREFIX" "$((10#$last_octet))"
+    else
+        printf 'unknown\n'
+    fi
+}
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
 fi
 
 # ======== 参数 ========
-name="${1:-vm1}"
-cpu="${2:-1}"
-memory="${3:-1024}"
-disk="${4:-20}"
-passwd="${5:-123456}"
-sshport="${6:-25001}"
-startport="${7:-35001}"
-endport="${8:-35025}"
+name="${1:-${VM_NAME:-vm1}}"
+cpu="${2:-${VM_CPU:-1}}"
+memory="${3:-${VM_MEMORY:-1024}}"
+disk="${4:-${VM_DISK:-20}}"
+passwd="${5:-${VM_PASSWORD:-}}"
+sshport="${6:-${VM_SSH_PORT:-25001}}"
+startport="${7:-${VM_START_PORT:-35001}}"
+endport="${8:-${VM_END_PORT:-35025}}"
+if [[ -z "$passwd" ]]; then
+    passwd="$(generate_password)"
+fi
 # $9 可能为附加标志（如 y/n），$10 可能才是系统名
 # 若 $9 非空且不像 y/n/yes/no 这类纯标志，则作为系统名；否则取 $10
 _raw9="${9:-}"
@@ -51,7 +233,7 @@ if [[ -n "$_raw10" && ("$_raw9" == "y" || "$_raw9" == "n" || "$_raw9" == "yes" |
 elif [[ -n "$_raw9" ]]; then
     system="$_raw9"
 else
-    system="debian"
+    system="${VM_SYSTEM:-debian}"
 fi
 
 # ======== 参数验证 ========
@@ -101,6 +283,7 @@ endport=$((10#$endport))
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
+# shellcheck disable=SC2034
 PACKAGE_UPDATE=(
     "! apt-get update && apt-get --fix-broken install -y && apt-get update"
     "apt-get update"
@@ -110,6 +293,7 @@ PACKAGE_UPDATE=(
     "pacman -Sy"
     "apk update"
 )
+# shellcheck disable=SC2034
 PACKAGE_INSTALL=(
     "apt-get -y install"
     "apt-get -y install"
@@ -164,7 +348,14 @@ fi
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
+    local shuffled_cdn_urls=()
+    if command -v shuf >/dev/null 2>&1; then
+        while IFS= read -r cdn_url; do
+            shuffled_cdn_urls+=("$cdn_url")
+        done < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
+    else
+        shuffled_cdn_urls=("${cdn_urls[@]}")
+    fi
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -237,8 +428,8 @@ system=$(echo "$system" | tr '[:upper:]' '[:lower:]')
 
 # 规范化别名（alma→almalinux，rocky→rockylinux，euler→openeuler）
 case "$system" in
-    alma*) system=$(echo "$system" | sed 's/^alma/almalinux/') ;;
-    rocky*) system=$(echo "$system" | sed 's/^rocky/rockylinux/') ;;
+    alma*) system="almalinux${system#alma}" ;;
+    rocky*) system="rockylinux${system#rocky}" ;;
     euler*) system="openeuler" ;;
 esac
 
@@ -247,11 +438,13 @@ esac
 system=$(echo "$system" | tr -d '_-')
 
 # 4 位 Ubuntu 版本号缩短（ubuntu2204→ubuntu22，ubuntu2404→ubuntu24）
-system=$(echo "$system" | sed 's/^\(ubuntu\)\([0-9][0-9]\)[0-9][0-9]$/\1\2/')
+if [[ "$system" =~ ^(ubuntu)([0-9][0-9])[0-9][0-9]$ ]]; then
+    system="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+fi
 
 # 拆分名称部分与版本部分
-en_system=$(echo "$system" | sed 's/[0-9]*$//')
-num_system=$(echo "$system" | sed 's/^[a-z]*//')
+en_system="${system%%[0-9]*}"
+num_system="${system#"$en_system"}"
 
 # 验证系统名称
 case "$en_system" in
@@ -310,6 +503,42 @@ case "$en_system" in
     openeuler)
         os_info="rhel8.0" ;;
 esac
+
+image_checksum_path() {
+    local img_path="$1"
+    printf '%s.sha256\n' "$img_path"
+}
+
+write_image_checksum() {
+    local img_path="$1" checksum_path
+    checksum_path=$(image_checksum_path "$img_path")
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        _yellow "  sha256sum not found, skipping checksum record for $img_path"
+        return 0
+    fi
+    sha256sum "$img_path" > "$checksum_path"
+}
+
+verify_cached_image() {
+    local img_path="$1" checksum_path
+    checksum_path=$(image_checksum_path "$img_path")
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        _yellow "  sha256sum not found, using cached image without checksum verification"
+        return 0
+    fi
+    if [[ -f "$checksum_path" ]]; then
+        if sha256sum -c "$checksum_path" >/dev/null 2>&1; then
+            _green "  ✓ Cached image checksum verified"
+            return 0
+        fi
+        _yellow "  Cached image checksum mismatch, removing stale image"
+        rm -f "$img_path" "$checksum_path" 2>/dev/null || true
+        return 1
+    fi
+    _yellow "  Cached image has no checksum record, creating one"
+    write_image_checksum "$img_path"
+    return 0
+}
 
 # ======== cloud 镜像官方回退 URL 映射 ========
 # 仅在组织预置镜像下载失败时使用
@@ -407,6 +636,7 @@ try_pve_kvm_images() {
         if curl -fL --progress-bar --connect-timeout 30 --max-time 600 \
                 -o "${img_path}.tmp" "$try_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
+            write_image_checksum "$img_path"
             _green "  ✓ Downloaded from pve_kvm_images: ${base_url##*/}"
             return 0
         fi
@@ -415,6 +645,7 @@ try_pve_kvm_images() {
         if curl -fsSL --connect-timeout 30 --max-time 600 \
                 -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
+            write_image_checksum "$img_path"
             _green "  ✓ Downloaded from pve_kvm_images (direct): ${base_url##*/}"
             return 0
         fi
@@ -435,6 +666,7 @@ try_kvm_images() {
     if curl -fL --progress-bar --connect-timeout 30 --max-time 600 \
             -o "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
+        write_image_checksum "$img_path"
         _green "  ✓ Downloaded from kvm_images: ${ver}.qcow2"
         return 0
     fi
@@ -443,6 +675,7 @@ try_kvm_images() {
     if curl -fsSL --connect-timeout 30 --max-time 600 \
             -o "${img_path}.tmp" "$base_url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
+        write_image_checksum "$img_path"
         _green "  ✓ Downloaded from kvm_images (direct): ${ver}.qcow2"
         return 0
     fi
@@ -460,8 +693,12 @@ download_cloud_image() {
     local img_path="${images_path}/${system}.qcow2"
 
     if [[ -f "$img_path" ]] && [[ -s "$img_path" ]]; then
-        _green "Base image already cached: $img_path"
-        return 0
+        if ! verify_cached_image "$img_path"; then
+            _yellow "Base image cache invalid, downloading again for system '${system}'..."
+        else
+            _green "Base image already cached: $img_path"
+            return 0
+        fi
     fi
 
     _yellow "Base image not cached, downloading for system '${system}'..."
@@ -508,6 +745,7 @@ download_cloud_image() {
                 [[ "$decompressed" != "$img_path" ]] && mv "$decompressed" "$img_path" 2>/dev/null || true
             fi
             if [[ -f "$img_path" ]] && [[ -s "$img_path" ]]; then
+                write_image_checksum "$img_path"
                 _green "  ✓ Image decompressed: $img_path"
                 return 0
             fi
@@ -523,6 +761,7 @@ download_cloud_image() {
                 -o "${img_path}.tmp" "${cdn_success_url}${CLOUD_IMG_URL}" 2>/dev/null && \
                 [[ -s "${img_path}.tmp" ]]; then
             mv "${img_path}.tmp" "$img_path"
+            write_image_checksum "$img_path"
             _green "  ✓ Downloaded via CDN"
             return 0
         fi
@@ -531,6 +770,7 @@ download_cloud_image() {
     if curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
             -o "${img_path}.tmp" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
         mv "${img_path}.tmp" "$img_path"
+        write_image_checksum "$img_path"
         _green "  ✓ Downloaded directly"
         return 0
     fi
@@ -575,7 +815,7 @@ allocate_ip() {
 # ======== 创建 cloud-init 配置 ========
 #   1. 使用 --cloud-init user-data=...,disable=on 传入（virt-install >= 4.0）
 #   2. 不安装额外软件包（避免在 TCG 模式下极其缓慢）
-#   3. cloud-init 完成后自动 shutdown，由后台守护进程重启 VM
+#   3. VM 保持运行，由后台守护进程等待 cloud-init 配置后 SSH 就绪
 # 回退方案：若 virt-install 不支持 --cloud-init，则手动创建 ISO
 
 create_cloudinit_yaml() {
@@ -714,6 +954,19 @@ fw_init_table() {
             nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
             nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
         fi
+        if is_ipv6_nat_enabled; then
+            nft add table ip6 qemu6 2>/dev/null || true
+            nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+            nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            if ! nft list chain ip6 qemu6 postrouting 2>/dev/null | grep -q masquerade; then
+                nft add rule ip6 qemu6 postrouting ip6 saddr "$QEMU_IPV6_SUBNET" ip6 daddr != "$QEMU_IPV6_SUBNET" masquerade 2>/dev/null || true
+            fi
+            if ! nft list chain ip6 qemu6 forward 2>/dev/null | grep -q "ct state"; then
+                nft add rule ip6 qemu6 forward ct state established,related accept 2>/dev/null || true
+                nft add rule ip6 qemu6 forward ip6 daddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
+                nft add rule ip6 qemu6 forward ip6 saddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
+            fi
+        fi
     else
         iptables -t nat -C POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || \
             iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
@@ -723,6 +976,16 @@ fw_init_table() {
             iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
             iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+        if is_ipv6_nat_enabled && command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -t nat -C POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || \
+                ip6tables -t nat -I POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || true
+            ip6tables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            ip6tables -C FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
+            ip6tables -C FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+                ip6tables -I FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
+        fi
     fi
 }
 
@@ -742,7 +1005,9 @@ fw_delete_vm_rules() {
                 | grep -F -- "--to-destination ${vm_ip}" \
                 | head -1 \
                 | sed 's/^-A /-D /')
-            iptables -t nat $rule 2>/dev/null || break
+            local -a rule_args=()
+            read -r -a rule_args <<< "$rule"
+            iptables -t nat "${rule_args[@]}" 2>/dev/null || break
         done
     fi
 }
@@ -783,6 +1048,11 @@ fw_save() {
             echo "table ip qemu"
             echo "delete table ip qemu"
             nft list table ip qemu
+            if is_ipv6_nat_enabled; then
+                echo "table ip6 qemu6"
+                echo "delete table ip6 qemu6"
+                nft list table ip6 qemu6
+            fi
         } > /etc/nftables.d/qemu.nft 2>/dev/null || true
     else
         # Save both IPv4 and IPv6 rules
@@ -801,6 +1071,7 @@ remove_dhcp_reservation() {
     local vm_name="$1" vm_mac="${2:-}" vm_ip="${3:-}"
     local dhcp_mac="$vm_mac" dhcp_ip="$vm_ip"
 
+    acquire_state_lock 60
     if [[ -z "$dhcp_mac" || -z "$dhcp_ip" ]]; then
         dhcp_mac=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "mac='[^']+'" | cut -d"'" -f2 | head -1 || true)
         dhcp_ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 | head -1 || true)
@@ -814,6 +1085,7 @@ remove_dhcp_reservation() {
             "<host mac='${dhcp_mac}' name='${vm_name}' ip='${dhcp_ip}' />" \
             --config 2>/dev/null || true
     fi
+    release_state_lock
 }
 
 cleanup_partial_vm() {
@@ -826,9 +1098,167 @@ cleanup_partial_vm() {
         fw_save
     fi
     remove_dhcp_reservation "$vm_name" "$vm_mac" "$vm_ip"
+    acquire_state_lock 60
+    remove_state_reservation "$vm_name"
+    release_state_lock
     rm -f "$vm_disk" "$ci_iso" \
         "/tmp/qemu-cloudinit-${vm_name}.yaml" \
         "/tmp/qemu-cloudinit-${vm_name}-meta.yaml" 2>/dev/null || true
+}
+
+vm_db_file() {
+    if [[ -f /usr/local/bin/qemu_db_file ]]; then
+        cat /usr/local/bin/qemu_db_file
+    else
+        printf '%s\n' "/var/lib/libvirt/qemu-vms.db"
+    fi
+}
+
+sql_escape() {
+    printf '%s' "${1:-}" | sed "s/'/''/g"
+}
+
+ensure_vm_db_schema() {
+    local db_file="$1"
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    mkdir -p "$(dirname "$db_file")"
+    sqlite3 "$db_file" <<'SQLEOF' >/dev/null 2>&1 || return 1
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS vms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vm_name TEXT UNIQUE NOT NULL,
+    ipv4 TEXT,
+    ipv6 TEXT,
+    mac TEXT,
+    bridge TEXT,
+    fw_backend TEXT,
+    ipv6_nat INTEGER DEFAULT 0,
+    ssh_port INTEGER,
+    start_port INTEGER,
+    end_port INTEGER,
+    cpu INTEGER,
+    memory INTEGER,
+    disk INTEGER,
+    system TEXT,
+    password TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_vms_ports ON vms(ssh_port, start_port, end_port);
+CREATE INDEX IF NOT EXISTS idx_vms_ipv4 ON vms(ipv4);
+SQLEOF
+    local column
+    for column in \
+        "ipv6 TEXT" \
+        "bridge TEXT" \
+        "fw_backend TEXT" \
+        "ipv6_nat INTEGER DEFAULT 0" \
+        "updated_at DATETIME"; do
+        local column_name="${column%% *}"
+        if ! sqlite3 "$db_file" "PRAGMA table_info(vms);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx "$column_name"; then
+            sqlite3 "$db_file" "ALTER TABLE vms ADD COLUMN ${column};" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+upsert_vm_db() {
+    local vm_name="$1" ssh_port="$2" password="$3" cpu_count="$4" mem_mb="$5" disk_gb="$6" start_p="$7" end_p="$8" sys="$9" ip_addr="${10}"
+    local mac_addr="${11:-unknown}" bridge="${12:-unknown}" fw_backend="${13:-unknown}" ipv6_addr="${14:-unknown}" ipv6_nat="${15:-false}"
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    local db_file ipv6_nat_value
+    db_file=$(vm_db_file)
+    ensure_vm_db_schema "$db_file" || return 0
+    ipv6_nat_value=0
+    [[ "$ipv6_nat" == true ]] && ipv6_nat_value=1
+    if ! sqlite3 "$db_file" >/dev/null 2>&1 <<SQLEOF
+INSERT INTO vms (
+    vm_name, ipv4, ipv6, mac, bridge, fw_backend, ipv6_nat,
+    ssh_port, start_port, end_port, cpu, memory, disk, system, password,
+    updated_at
+) VALUES (
+    '$(sql_escape "$vm_name")',
+    '$(sql_escape "$ip_addr")',
+    '$(sql_escape "$ipv6_addr")',
+    '$(sql_escape "$mac_addr")',
+    '$(sql_escape "$bridge")',
+    '$(sql_escape "$fw_backend")',
+    ${ipv6_nat_value},
+    ${ssh_port},
+    ${start_p},
+    ${end_p},
+    ${cpu_count},
+    ${mem_mb},
+    ${disk_gb},
+    '$(sql_escape "$sys")',
+    '$(sql_escape "$password")',
+    CURRENT_TIMESTAMP
+)
+ON CONFLICT(vm_name) DO UPDATE SET
+    ipv4=excluded.ipv4,
+    ipv6=excluded.ipv6,
+    mac=excluded.mac,
+    bridge=excluded.bridge,
+    fw_backend=excluded.fw_backend,
+    ipv6_nat=excluded.ipv6_nat,
+    ssh_port=excluded.ssh_port,
+    start_port=excluded.start_port,
+    end_port=excluded.end_port,
+    cpu=excluded.cpu,
+    memory=excluded.memory,
+    disk=excluded.disk,
+    system=excluded.system,
+    password=excluded.password,
+    updated_at=CURRENT_TIMESTAMP;
+SQLEOF
+    then
+        if ! sqlite3 "$db_file" >/dev/null 2>&1 <<SQLEOF
+DELETE FROM vms WHERE vm_name='$(sql_escape "$vm_name")';
+INSERT INTO vms (
+    vm_name, ipv4, ipv6, mac, bridge, fw_backend, ipv6_nat,
+    ssh_port, start_port, end_port, cpu, memory, disk, system, password,
+    created_at, updated_at
+) VALUES (
+    '$(sql_escape "$vm_name")',
+    '$(sql_escape "$ip_addr")',
+    '$(sql_escape "$ipv6_addr")',
+    '$(sql_escape "$mac_addr")',
+    '$(sql_escape "$bridge")',
+    '$(sql_escape "$fw_backend")',
+    ${ipv6_nat_value},
+    ${ssh_port},
+    ${start_p},
+    ${end_p},
+    ${cpu_count},
+    ${mem_mb},
+    ${disk_gb},
+    '$(sql_escape "$sys")',
+    '$(sql_escape "$password")',
+    CURRENT_TIMESTAMP,
+    CURRENT_TIMESTAMP
+);
+SQLEOF
+        then
+            _yellow "  SQLite VM database update skipped for ${vm_name}"
+        fi
+    fi
+}
+
+append_vmlog() {
+    local vm_name="$1" ssh_port="$2" password="$3" cpu_count="$4" mem_mb="$5" disk_gb="$6" start_p="$7" end_p="$8" sys="$9" ip_addr="${10}"
+    local mac_addr="${11:-unknown}" bridge="${12:-unknown}" fw_backend="${13:-unknown}" ipv6_addr="${14:-unknown}" ipv6_nat="${15:-false}"
+    local tmpfile
+    acquire_state_lock 60
+    tmpfile=$(mktemp)
+    if [[ -f /root/vmlog ]]; then
+        grep -v "^${vm_name} " /root/vmlog > "$tmpfile" 2>/dev/null || true
+    fi
+    printf '%s %s %s %s %s %s %s %s %s %s mac=%s bridge=%s fw=%s ipv6=%s ipv6_nat=%s\n' \
+        "$vm_name" "$ssh_port" "$password" "$cpu_count" "$mem_mb" "$disk_gb" "$start_p" "$end_p" "$sys" "$ip_addr" \
+        "$mac_addr" "$bridge" "$fw_backend" "$ipv6_addr" "$ipv6_nat" >> "$tmpfile"
+    mv "$tmpfile" /root/vmlog
+    upsert_vm_db "$vm_name" "$ssh_port" "$password" "$cpu_count" "$mem_mb" "$disk_gb" "$start_p" "$end_p" "$sys" "$ip_addr" "$mac_addr" "$bridge" "$fw_backend" "$ipv6_addr" "$ipv6_nat"
+    remove_state_reservation "$vm_name"
+    release_state_lock
 }
 
 # ======== 检测公网 IP ========
@@ -974,23 +1404,18 @@ main() {
     vm_mac=$(generate_mac)
     _blue "VM MAC: $vm_mac"
 
-    # 分配静态 IP
+    # 分配静态 IP 并写入 DHCP 预留。该段加锁，避免并发创建分到相同 IP。
     local vm_ip
-    vm_ip=$(allocate_ip) || { _red "Failed to allocate IP address"; exit 1; }
+    acquire_state_lock 60
+    if ! check_state_conflicts "$name" "$sshport" "$startport" "$endport"; then
+        release_state_lock
+        _red "$state_conflict_message"
+        exit 1
+    fi
+    vm_ip=$(allocate_ip) || { release_state_lock; _red "Failed to allocate IP address"; exit 1; }
     _blue "VM IP: $vm_ip"
-
-    # 创建 VM 磁盘
-    local vm_disk
-    vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to create VM disk"; exit 1; }
-
-    # 创建 cloud-init 配置
-    _yellow "Creating cloud-init configuration..."
-    local use_cloudinit_flag=false
-    local ci_yaml=""
-    local ci_iso=""
-    # 始终使用手动创建 ISO 的方式（更可靠，virt-install --cloud-init 存在 user-data 为空的 bug）
-    ci_iso=$(create_cloudinit_iso "$name" "$passwd") || { _red "Failed to create cloud-init ISO"; exit 1; }
-    _green "  ✓ cloud-init ISO: $ci_iso"
+    local vm_ipv6
+    vm_ipv6=$(vm_expected_ipv6 "$vm_ip")
 
     # ── 先配置好网络/钩子，再启动 VM──────────────
 
@@ -1004,13 +1429,31 @@ main() {
         _yellow "  Removing stale DHCP reservation: ${old_dhcp_mac} -> ${old_dhcp_ip}"
         remove_dhcp_reservation "$name" "$old_dhcp_mac" "$old_dhcp_ip"
     fi
-    virsh net-update default add ip-dhcp-host \
+    if ! virsh net-update default add ip-dhcp-host \
         "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
-        --live --config 2>/dev/null || \
-    virsh net-update default add ip-dhcp-host \
-        "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
-        --config 2>/dev/null || true
+        --live --config 2>/dev/null && \
+        ! virsh net-update default add ip-dhcp-host \
+            "<host mac='${vm_mac}' name='${name}' ip='${vm_ip}' />" \
+            --config 2>/dev/null; then
+        release_state_lock
+        cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "" ""
+        _red "Failed to add DHCP reservation"
+        exit 1
+    fi
+    add_state_reservation "$name" "$sshport" "$startport" "$endport" "$vm_ip" "$vm_mac"
+    release_state_lock
     _green "  ✓ DHCP reservation: $vm_mac -> $vm_ip"
+
+    # 创建 VM 磁盘
+    local vm_disk
+    vm_disk=$(create_disk "$name" "$disk") || { cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "" ""; _red "Failed to create VM disk"; exit 1; }
+
+    # 创建 cloud-init 配置
+    _yellow "Creating cloud-init configuration..."
+    local ci_iso=""
+    # 始终使用手动创建 ISO 的方式（更可靠，virt-install --cloud-init 存在 user-data 为空的 bug）
+    ci_iso=$(create_cloudinit_iso "$name" "$passwd") || { cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "$vm_disk" ""; _red "Failed to create cloud-init ISO"; exit 1; }
+    _green "  ✓ cloud-init ISO: $ci_iso"
 
     # 配置端口转发
     detect_fw
@@ -1020,7 +1463,8 @@ main() {
 
     # 清除目标 IP 的旧 dnsmasq 租约（防止旧 MAC 的租约阻止新 MAC 获取预留 IP）
     # 使用 python3 精确删除，不影响其他 VM 的租约
-    local lease_file="/var/lib/libvirt/dnsmasq/virbr0.status"
+    local lease_file="/var/lib/libvirt/dnsmasq/${bridge_name}.status"
+    acquire_state_lock 60
     if [[ -f "$lease_file" ]]; then
         python3 -c "
 import json, sys
@@ -1038,6 +1482,7 @@ except:
     fi
     # 刷新 dnsmasq 使其重新读取租约（发送 SIGHUP）
     pkill -HUP dnsmasq 2>/dev/null || true
+    release_state_lock
 
     # ── 部署虚拟机 ──────────────────────────────────────────────────────
 
@@ -1167,7 +1612,7 @@ except:
     fi
 
     # 清理临时文件
-    rm -f /tmp/qemu-cloudinit-${name}.yaml /tmp/qemu-cloudinit-${name}-meta.yaml 2>/dev/null || true
+    rm -f "/tmp/qemu-cloudinit-${name}.yaml" "/tmp/qemu-cloudinit-${name}-meta.yaml" 2>/dev/null || true
 
     if [[ $virt_rc -ne 0 ]]; then
         _red "VM deployment failed"
@@ -1209,7 +1654,11 @@ except:
     _green "======================================================"
 
     # 记录到日志文件
-    echo "${name} ${sshport} ${passwd} ${cpu} ${memory} ${disk} ${startport} ${endport} ${system} ${vm_ip}" >> /root/vmlog
+    local ipv6_nat_state=false
+    if is_ipv6_nat_enabled; then
+        ipv6_nat_state=true
+    fi
+    append_vmlog "$name" "$sshport" "$passwd" "$cpu" "$memory" "$disk" "$startport" "$endport" "$system" "$vm_ip" "$vm_mac" "$bridge_name" "${FW_BACKEND:-unknown}" "$vm_ipv6" "$ipv6_nat_state"
     _green "VM info saved to /root/vmlog"
 }
 

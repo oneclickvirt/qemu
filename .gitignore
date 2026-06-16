@@ -1,0 +1,45 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Local databases and state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+vmlog
+qemu-vms.db
+
+# VM images and generated media
+*.qcow2
+*.raw
+*.img
+*.iso
+*.xz
+*.sha256
+vm-*
+
+# Logs, screenshots and reports
+*.log
+*.out
+*.err
+screenshots/
+playwright-report/
+test-results/
+coverage/
+
+# Caches and temporary files
+.cache/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+.DS_Store

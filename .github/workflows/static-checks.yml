@@ -1,0 +1,54 @@
+name: Static Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  shell-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Bash syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in qemuinstall.sh qemuuninstall.sh scripts/*.sh; do
+            bash -n "$file"
+          done
+
+      - name: Optional ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck qemuinstall.sh qemuuninstall.sh scripts/*.sh
+          else
+            echo "shellcheck not available on runner; bash syntax check already completed"
+          fi
+
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RIn \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            --exclude='*.md' \
+            -E 'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{36,}' \
+            .; then
+            echo "Potential secret material found"
+            exit 1
+          fi
