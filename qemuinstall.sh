@@ -163,16 +163,16 @@ install_base_deps() {
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz-utils dnsmasq-base genisoimage 2>/dev/null || true
+                socat unzip tar jq xz-utils dnsmasq-base genisoimage sshpass 2>/dev/null || true
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute \
-                socat unzip tar jq xz dnsmasq genisoimage 2>/dev/null || true
+                socat unzip tar jq xz dnsmasq genisoimage sshpass 2>/dev/null || true
             ;;
         Alpine)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz cdrkit 2>/dev/null || true
+                socat unzip tar jq xz cdrkit sshpass 2>/dev/null || true
             ;;
     esac
     _green "Base dependencies installed"
