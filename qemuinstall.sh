@@ -130,7 +130,63 @@ check_cdn_file() {
 }
 
 host_has_ipv6_default_route() {
-    ip -6 route show default 2>/dev/null | grep -q .
+    local route source
+    route=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null) || return 1
+    [[ "$route" == *" dev "* ]] || return 1
+    [[ "$route" != *"unreachable"* && "$route" != *"prohibit"* && "$route" != *"blackhole"* ]] || return 1
+    source=$(awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}' <<< "$route")
+    [[ "$source" == *:* ]] || return 1
+    case "${source,,}" in
+        fc*|fd*|fe8*|fe9*|fea*|feb*|::1) return 1 ;;
+    esac
+    return 0
+}
+
+ipv6_default_route_interface() {
+    ip -6 route show default 2>/dev/null | awk '
+        /default/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+qemu_ipv6_network_xml() {
+    cat <<NETEOF
+<ip family='ipv6' address='${QEMU_IPV6_GATEWAY}' prefix='64'>
+  <dhcp>
+    <range start='${QEMU_IPV6_DHCP_START}' end='${QEMU_IPV6_DHCP_END}'/>
+  </dhcp>
+</ip>
+NETEOF
+}
+
+default_network_has_qemu_ipv6() {
+    virsh net-dumpxml default 2>/dev/null | grep -E '<ip[[:space:]]' | \
+        grep -Eq "family=['\"]ipv6['\"][^>]*address=['\"]${QEMU_IPV6_GATEWAY}['\"]|address=['\"]${QEMU_IPV6_GATEWAY}['\"][^>]*family=['\"]ipv6['\"]"
+}
+
+ensure_default_network_ipv6() {
+    if default_network_has_qemu_ipv6; then
+        return 0
+    fi
+
+    _yellow "Adding the managed ULA IPv6 range to the existing default network..."
+    local xml
+    xml=$(qemu_ipv6_network_xml)
+    if ! virsh net-update default add ip "$xml" --live --config >/dev/null 2>&1; then
+        _yellow "Could not add the ULA IPv6 range to the existing default network; IPv4 networking remains available"
+        return 1
+    fi
+    if ! default_network_has_qemu_ipv6; then
+        _yellow "The default network did not retain the managed ULA IPv6 range; IPv6 NAT is disabled"
+        return 1
+    fi
+    _green "  ✓ Default NAT network IPv6 range is ready: ${QEMU_IPV6_SUBNET}"
 }
 
 # ======== KVM 虚拟化支持检测 ========
@@ -283,9 +339,11 @@ configure_default_network() {
         fi
         # 创建默认网络 XML
         cat > /tmp/qemu-default-net.xml <<NETEOF
-<network>
+<network ipv6='yes'>
   <name>default</name>
-  <forward mode='nat'/>
+  <forward mode='nat'>
+    <nat ipv6='yes'/>
+  </forward>
   <bridge name='virbr0' stp='on' delay='0'/>
   <ip address='192.168.122.1' netmask='255.255.255.0'>
     <dhcp>
@@ -311,6 +369,9 @@ NETEOF
         virsh net-autostart default 2>/dev/null || true
         _green "  ✓ Default NAT network is running"
     fi
+    if ! ensure_default_network_ipv6; then
+        _yellow "  IPv6 NAT will stay disabled until the default network has ${QEMU_IPV6_SUBNET}"
+    fi
     # 保存网络网桥名
     local bridge_name
     bridge_name=$(virsh net-dumpxml default 2>/dev/null | grep '<bridge' | grep -oP 'name="\K[^"]+' || echo "virbr0")
@@ -335,14 +396,68 @@ HOOKEOF
     fi
 }
 
+ipv6_forwarding_enabled() {
+    [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)" == "1" ]]
+}
+
+configure_ipv6_nat_nft() {
+    nft add table ip6 qemu6 2>/dev/null || true
+    nft list table ip6 qemu6 >/dev/null 2>&1 || return 1
+    nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+    nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+
+    local postrouting forward
+    postrouting=$(nft list chain ip6 qemu6 postrouting 2>/dev/null) || return 1
+    if ! grep -Fq "ip6 saddr ${QEMU_IPV6_SUBNET}" <<< "$postrouting" || ! grep -Fq 'masquerade' <<< "$postrouting"; then
+        nft add rule ip6 qemu6 postrouting ip6 saddr "$QEMU_IPV6_SUBNET" ip6 daddr != "$QEMU_IPV6_SUBNET" masquerade 2>/dev/null || return 1
+    fi
+
+    forward=$(nft list chain ip6 qemu6 forward 2>/dev/null) || return 1
+    if ! grep -Fq 'ct state established,related accept' <<< "$forward"; then
+        nft add rule ip6 qemu6 forward ct state established,related accept 2>/dev/null || return 1
+    fi
+    if ! grep -Fq "ip6 daddr ${QEMU_IPV6_SUBNET} accept" <<< "$forward"; then
+        nft add rule ip6 qemu6 forward ip6 daddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || return 1
+    fi
+    if ! grep -Fq "ip6 saddr ${QEMU_IPV6_SUBNET} accept" <<< "$forward"; then
+        nft add rule ip6 qemu6 forward ip6 saddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || return 1
+    fi
+
+    postrouting=$(nft list chain ip6 qemu6 postrouting 2>/dev/null) || return 1
+    forward=$(nft list chain ip6 qemu6 forward 2>/dev/null) || return 1
+    grep -Fq "ip6 saddr ${QEMU_IPV6_SUBNET}" <<< "$postrouting" && \
+        grep -Fq 'masquerade' <<< "$postrouting" && \
+        grep -Fq "ip6 daddr ${QEMU_IPV6_SUBNET} accept" <<< "$forward" && \
+        grep -Fq "ip6 saddr ${QEMU_IPV6_SUBNET} accept" <<< "$forward"
+}
+
+configure_ipv6_nat_iptables() {
+    command -v ip6tables >/dev/null 2>&1 || return 1
+
+    ip6tables -t nat -C POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || \
+        ip6tables -t nat -I POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || return 1
+    ip6tables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        ip6tables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
+    ip6tables -C FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+        ip6tables -I FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || return 1
+    ip6tables -C FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
+        ip6tables -I FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || return 1
+
+    ip6tables -t nat -C POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null && \
+        ip6tables -C FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null && \
+        ip6tables -C FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null
+}
+
 # ======== 配置防火墙 ========
 configure_firewall() {
     _yellow "Configuring firewall rules..."
     local ipv6_nat_enabled=false
-    if host_has_ipv6_default_route; then
-        ipv6_nat_enabled=true
+    local ipv6_nat_requested=false
+    if host_has_ipv6_default_route && default_network_has_qemu_ipv6 && ipv6_forwarding_enabled; then
+        ipv6_nat_requested=true
+    else
+        _yellow "IPv6 NAT prerequisites are incomplete (route, managed ULA network, or forwarding); NAT66 is disabled"
     fi
-    echo "$ipv6_nat_enabled" > /usr/local/bin/qemu_ipv6_nat_enabled
     if command -v nft >/dev/null 2>&1; then
         echo "nft" > /usr/local/bin/qemu_fw_backend
         _green "  Using nftables backend"
@@ -360,17 +475,11 @@ configure_firewall() {
             nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
             nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
         fi
-        if [[ "$ipv6_nat_enabled" == true ]]; then
-            nft add table ip6 qemu6 2>/dev/null || true
-            nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-            nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
-            if ! nft list chain ip6 qemu6 postrouting 2>/dev/null | grep -q masquerade; then
-                nft add rule ip6 qemu6 postrouting ip6 saddr "$QEMU_IPV6_SUBNET" ip6 daddr != "$QEMU_IPV6_SUBNET" masquerade 2>/dev/null || true
-            fi
-            if ! nft list chain ip6 qemu6 forward 2>/dev/null | grep -q "ct state"; then
-                nft add rule ip6 qemu6 forward ct state established,related accept 2>/dev/null || true
-                nft add rule ip6 qemu6 forward ip6 daddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
-                nft add rule ip6 qemu6 forward ip6 saddr "$QEMU_IPV6_SUBNET" accept 2>/dev/null || true
+        if [[ "$ipv6_nat_requested" == true ]]; then
+            if configure_ipv6_nat_nft; then
+                ipv6_nat_enabled=true
+            else
+                _yellow "nftables could not install or verify NAT66 rules; IPv6 NAT stays disabled"
             fi
         fi
         # Persist nft rules
@@ -405,15 +514,12 @@ configure_firewall() {
             iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
             iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
-        if [[ "$ipv6_nat_enabled" == true ]] && command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -t nat -C POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || \
-                ip6tables -t nat -I POSTROUTING -s "$QEMU_IPV6_SUBNET" ! -d "$QEMU_IPV6_SUBNET" -j MASQUERADE 2>/dev/null || true
-            ip6tables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-                ip6tables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-            ip6tables -C FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
-                ip6tables -I FORWARD -d "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
-            ip6tables -C FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || \
-                ip6tables -I FORWARD -s "$QEMU_IPV6_SUBNET" -j ACCEPT 2>/dev/null || true
+        if [[ "$ipv6_nat_requested" == true ]]; then
+            if configure_ipv6_nat_iptables; then
+                ipv6_nat_enabled=true
+            else
+                _yellow "ip6tables could not install or verify NAT66 rules; IPv6 NAT stays disabled"
+            fi
         fi
         
         # Install persistence tools
@@ -440,18 +546,40 @@ configure_firewall() {
         _red "No firewall tool available (nft or iptables)"
         exit 1
     fi
+
+    echo "$ipv6_nat_enabled" > /usr/local/bin/qemu_ipv6_nat_enabled
+    if [[ "$ipv6_nat_enabled" == true ]]; then
+        _green "  ✓ NAT66 rules verified for ${QEMU_IPV6_SUBNET}"
+    fi
 }
 
 # ======== 配置 sysctl 转发参数 ========
 configure_sysctl() {
     _yellow "Configuring sysctl for IP forwarding..."
+    local ipv6_uplink=""
     cat > /etc/sysctl.d/99-qemu.conf <<'EOF'
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-qemu.conf 2>/dev/null || true
-    _green "IP forwarding enabled"
+    ipv6_uplink=$(ipv6_default_route_interface 2>/dev/null || true)
+    if [[ "$ipv6_uplink" =~ ^[[:alnum:]_.:-]+$ ]] && \
+       [[ -e "/proc/sys/net/ipv6/conf/${ipv6_uplink}/accept_ra" ]]; then
+        # Forwarding suppresses normal RA processing on Linux. Preserve the
+        # external SLAAC default route without accepting RAs on every bridge.
+        printf 'net.ipv6.conf.%s.accept_ra = 2\n' "$ipv6_uplink" >> /etc/sysctl.d/99-qemu.conf
+    else
+        ipv6_uplink=""
+    fi
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-qemu.conf >/dev/null 2>&1 || true
+    if [[ -n "$ipv6_uplink" ]]; then
+        sysctl -w "net.ipv6.conf.${ipv6_uplink}.accept_ra=2" >/dev/null 2>&1 || true
+    fi
+    if ipv6_forwarding_enabled; then
+        _green "IP forwarding enabled"
+    else
+        _yellow "IPv6 forwarding could not be enabled; NAT66 will remain disabled"
+    fi
 }
 
 # ======== 检测公网 IPv4 ========
@@ -480,7 +608,7 @@ check_ipv6() {
     if [[ -f /usr/local/bin/qemu_ipv6_nat_enabled ]] && grep -q '^true$' /usr/local/bin/qemu_ipv6_nat_enabled 2>/dev/null; then
         _green "  ✓ IPv6 NAT enabled for ${QEMU_IPV6_SUBNET}"
     else
-        _yellow "  IPv6 NAT disabled (no IPv6 default route detected)"
+        _yellow "  IPv6 NAT disabled (route, managed ULA network, forwarding, or firewall verification failed)"
     fi
 }
 
@@ -608,8 +736,8 @@ main() {
     configure_storage_pool
     configure_default_network
     configure_hooks
-    configure_firewall
     configure_sysctl
+    configure_firewall
     detect_interface
     check_ipv6
     init_database

@@ -45,7 +45,6 @@ LOCK_DIR="/tmp/qemu-vm-state.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 RESERVATION_FILE="/tmp/qemu-vm-reservations"
 QEMU_IPV6_SUBNET="fd42:122::/64"
-QEMU_IPV6_PREFIX="fd42:122::"
 lock_acquired=false
 state_lock_depth=0
 
@@ -197,14 +196,40 @@ is_ipv6_nat_enabled() {
     [[ -f /usr/local/bin/qemu_ipv6_nat_enabled ]] && grep -q '^true$' /usr/local/bin/qemu_ipv6_nat_enabled 2>/dev/null
 }
 
-vm_expected_ipv6() {
-    local ipv4="$1" last_octet
-    last_octet="${ipv4##*.}"
-    if [[ "$last_octet" =~ ^[0-9]+$ ]]; then
-        printf '%s%x\n' "$QEMU_IPV6_PREFIX" "$((10#$last_octet))"
-    else
-        printf 'unknown\n'
+vm_ipv6_from_lease() {
+    local vm_name="$1" vm_mac="${2:-}"
+    local address
+    address=$(virsh domifaddr "$vm_name" --source lease 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                candidate = $i
+                if (candidate ~ /:.*\/[0-9]+$/) {
+                    sub(/\/[0-9]+$/, "", candidate)
+                    if (candidate !~ /^fe80:/) {
+                        print candidate
+                        exit
+                    }
+                }
+            }
+        }
+    ' || true)
+    if [[ -z "$address" && -n "$vm_mac" ]]; then
+        address=$(virsh net-dhcp-leases default "$vm_mac" 2>/dev/null | awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    candidate = $i
+                    if (candidate ~ /:.*\/[0-9]+$/) {
+                        sub(/\/[0-9]+$/, "", candidate)
+                        if (candidate !~ /^fe80:/) {
+                            print candidate
+                            exit
+                        }
+                    }
+                }
+            }
+        ' || true)
     fi
+    [[ -n "$address" ]] && printf '%s\n' "$address"
 }
 
 if [ "$(id -u)" != "0" ]; then
@@ -1414,8 +1439,7 @@ main() {
     fi
     vm_ip=$(allocate_ip) || { release_state_lock; _red "Failed to allocate IP address"; exit 1; }
     _blue "VM IP: $vm_ip"
-    local vm_ipv6
-    vm_ipv6=$(vm_expected_ipv6 "$vm_ip")
+    local vm_ipv6="pending"
 
     # ── 先配置好网络/钩子，再启动 VM──────────────
 
@@ -1621,6 +1645,9 @@ except:
     fi
 
     _green "  ✓ VM created: $name"
+
+    vm_ipv6=$(vm_ipv6_from_lease "$name" "$vm_mac")
+    [[ -n "$vm_ipv6" ]] || vm_ipv6="pending"
 
     # 设置 VM 开机自启
     virsh autostart "$name" 2>/dev/null || true

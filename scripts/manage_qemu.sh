@@ -94,6 +94,42 @@ sql_escape() {
     printf '%s' "${1:-}" | sed "s/'/''/g"
 }
 
+vm_ipv6_from_lease() {
+    local vm_name="$1" vm_mac="${2:-}"
+    local address
+    address=$(virsh domifaddr "$vm_name" --source lease 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                candidate = $i
+                if (candidate ~ /:.*\/[0-9]+$/) {
+                    sub(/\/[0-9]+$/, "", candidate)
+                    if (candidate !~ /^fe80:/) {
+                        print candidate
+                        exit
+                    }
+                }
+            }
+        }
+    ' || true)
+    if [[ -z "$address" && -n "$vm_mac" ]]; then
+        address=$(virsh net-dhcp-leases default "$vm_mac" 2>/dev/null | awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    candidate = $i
+                    if (candidate ~ /:.*\/[0-9]+$/) {
+                        sub(/\/[0-9]+$/, "", candidate)
+                        if (candidate !~ /^fe80:/) {
+                            print candidate
+                            exit
+                        }
+                    }
+                }
+            }
+        ' || true)
+    fi
+    [[ -n "$address" ]] && printf '%s\n' "$address"
+}
+
 db_query_vm() {
     local vm_name="$1" db_file
     command -v sqlite3 >/dev/null 2>&1 || return 0
@@ -194,7 +230,7 @@ print_vm_info() {
     fi
 
     local log_line db_line state mac ip ssh_port start_port end_port system cpu memory disk extra_info
-    local log_mac bridge fw_backend ipv6 ipv6_nat
+    local log_mac bridge fw_backend ipv6 ipv6_nat observed_ipv6
     log_line=$(grep "^${vm_name} " /root/vmlog 2>/dev/null | tail -1 || true)
     if [[ -n "$log_line" ]]; then
         read -r _ ssh_port _ cpu memory disk start_port end_port system ip extra_info <<< "$log_line"
@@ -219,6 +255,8 @@ print_vm_info() {
         state=$(virsh domstate "$vm_name" 2>/dev/null || echo "unknown")
         mac=$(virsh domiflist "$vm_name" 2>/dev/null | awk '/virtio/{print $5; exit}')
         [[ -z "$mac" ]] && mac="$log_mac"
+        observed_ipv6=$(vm_ipv6_from_lease "$vm_name" "$mac")
+        [[ -n "$observed_ipv6" ]] && ipv6="$observed_ipv6"
         if [[ -z "$ip" ]]; then
             ip=$(virsh net-dumpxml default 2>/dev/null | grep "name='${vm_name}'" | grep -oP "ip='[^']+'" | cut -d"'" -f2 | head -1 || true)
         fi

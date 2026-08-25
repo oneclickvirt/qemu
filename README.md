@@ -248,7 +248,9 @@ bash qemuuninstall.sh -y
 - 安装时会检测已有 `virbr0` 是否由 libvirt 管理，避免和宿主机已有网桥冲突
 - 虚拟机获得 `192.168.122.2`~`192.168.122.99` 范围内的静态 IP（通过 DHCP 预留）
 - 通过 nftables 或 iptables DNAT 实现宿主机端口到虚拟机端口的映射
-- 新安装的 default 网络包含 `fd42:122::/64` ULA IPv6 段；宿主机存在 IPv6 默认路由时会启用 NAT66，并记录 `ipv6_nat=true`
+- 新安装的 default 网络显式启用 libvirt IPv6 NAT，并包含 `fd42:122::/64` ULA IPv6 段；已有 default 网络会通过 `virsh net-update --live --config` 尝试补齐该段，失败时保留 IPv4 网络且不误报 IPv6 可用
+- NAT66 只有在出口路由具有全局 IPv6 源地址、IPv6 转发已启用且 nftables/ip6tables 规则实际校验成功后才记录 `ipv6_nat=true`
+- IPv6 地址来自 libvirt 的实际 DHCPv6 租约，不会再根据 IPv4 尾段推测；创建刚结束而尚未获得租约时记为 `pending`，可用 `manage_qemu.sh info <name>` 查询最新地址
 - 创建中会临时预留 VM 名称、SSH 端口和额外端口范围，避免并发创建时复用同一资源
 - SSH 端口映射：`宿主机:sshport` → `vm_ip:22`
 - 额外端口映射：`宿主机:startport-endport` → `vm_ip:startport-endport`
@@ -267,7 +269,7 @@ vm2 25002 passwd456 1 1024 20 35026 35050 ubuntu 192.168.122.3
 新版本会在上述 10 个兼容字段后追加网络元数据，例如：
 
 ```
-mac=52:54:xx:xx:xx:xx bridge=virbr0 fw=nft ipv6=fd42:122::2 ipv6_nat=true
+mac=52:54:xx:xx:xx:xx bridge=virbr0 fw=nft ipv6=fd42:122::102 ipv6_nat=true
 ```
 
 创建、删除和 `manage_qemu.sh set-resources` 会同步维护 vmlog 与 SQLite 记录；若 vmlog 缺失，`manage_qemu.sh info all` 会回退读取 SQLite。
