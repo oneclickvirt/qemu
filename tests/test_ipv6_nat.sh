@@ -28,6 +28,14 @@ source <(extract_function "$installer" qemu_ipv6_network_xml)
 source <(extract_function "$installer" default_network_has_qemu_ipv6)
 # shellcheck disable=SC1090 # The test intentionally loads installer helpers.
 source <(extract_function "$installer" ensure_default_network_ipv6)
+# shellcheck disable=SC1090 # The test intentionally loads the host overlap helper.
+source <(extract_function "$installer" qemu_ipv6_subnet_overlaps_host)
+# shellcheck disable=SC1090 # The test intentionally loads the ULA selector helper.
+source <(extract_function "$installer" qemu_ipv6_candidate)
+# shellcheck disable=SC1090 # The test intentionally loads the persisted ULA selector.
+source <(extract_function "$installer" qemu_ipv6_candidate_is_safe)
+# shellcheck disable=SC1090 # The test intentionally loads the persisted ULA selector.
+source <(extract_function "$installer" select_qemu_ipv6_subnet)
 # shellcheck disable=SC1090 # The test intentionally loads installer helpers.
 source <(extract_function "$installer" configure_ipv6_nat_nft)
 # shellcheck disable=SC1090 # The test intentionally loads installer helpers.
@@ -39,12 +47,81 @@ QEMU_IPV6_SUBNET="fd42:122::/64"
 QEMU_IPV6_GATEWAY="fd42:122::1"
 QEMU_IPV6_DHCP_START="fd42:122::100"
 QEMU_IPV6_DHCP_END="fd42:122::1ff"
+QEMU_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/qemu-ipv6-state.XXXXXX")
+trap 'rm -rf -- "$QEMU_STATE_DIR"' EXIT
 _yellow() { :; }
 _green() { :; }
 
 ip() {
-    printf '%s\n' '2001:4860:4860::8888 via fe80::1 dev eth0 src 2a14:6781:a::9 metric 1024'
+    case "$*" in
+        '-6 -o addr show'*)
+            printf '%s\n' '2: eth0    inet6 2a14:6781:000a:0000::9/64 scope global'
+            ;;
+        '-6 route show table all')
+            printf '%s\n' '2a14:6781:a::/64 dev eth0 proto kernel metric 256'
+            ;;
+        *)
+            printf '%s\n' '2001:4860:4860::8888 via fe80::1 dev eth0 src 2a14:6781:a::9 metric 1024'
+            ;;
+    esac
 }
+if ! qemu_ipv6_subnet_overlaps_host '2a14:6781:a::1:0:0/96'; then
+    printf 'connected host IPv6 route was not detected by QEMU overlap check\n' >&2
+    exit 1
+fi
+if qemu_ipv6_subnet_overlaps_host "$(qemu_ipv6_candidate 0)"; then
+    printf 'QEMU ULA candidate unexpectedly overlaps the host route\n' >&2
+    exit 1
+fi
+
+# The default libvirt network owns the persisted ULA through virbr0. Its local
+# /128 and connected /64 must not make the installer rotate to a different
+# subnet on every rerun, while a ULA route on an uplink remains a conflict.
+printf '%s\n' 'fd42:122:7::/64' >"$QEMU_STATE_DIR/qemu_ipv6_subnet"
+QEMU_IPV6_SUBNET='fd42:122::/64'
+ip() {
+    case "$*" in
+        '-6 -o addr show'*)
+            printf '%s\n' '2: eth0    inet6 2a14:6781:000a:0000::9/64 scope global'
+            printf '%s\n' '8: virbr0    inet6 fd42:122:7::1/64 scope global'
+            ;;
+        '-6 route show table all')
+            printf '%s\n' '2a14:6781:a::/64 dev eth0 proto kernel metric 256'
+            printf '%s\n' 'fd42:122:7::/64 dev virbr0 proto kernel metric 256'
+            printf '%s\n' 'local fd42:122:7::1 dev virbr0 table local'
+            printf '%s\n' 'fd42:122:8::/64 dev eth0 proto static metric 256'
+            ;;
+        *)
+            printf '%s\n' '2001:4860:4860::8888 via fe80::1 dev eth0 src 2a14:6781:a::9 metric 1024'
+            ;;
+    esac
+}
+select_qemu_ipv6_subnet
+if [[ "$QEMU_IPV6_SUBNET" != 'fd42:122:7::/64' ]]; then
+    printf 'persisted virbr0 ULA subnet was not retained: %s\n' "$QEMU_IPV6_SUBNET" >&2
+    exit 1
+fi
+if qemu_ipv6_candidate_is_safe 'fd42:122:8::/64' false; then
+    printf 'unrelated ULA child of a host route was accepted\n' >&2
+    exit 1
+fi
+
+# Legacy public state and an explicit ::/0 route must respectively migrate to
+# a ULA and leave the ULA selector usable.
+printf '%s\n' '2001:db8:1::/64' >"$QEMU_STATE_DIR/qemu_ipv6_subnet"
+QEMU_IPV6_SUBNET='fd42:122::/64'
+ip() {
+    case "$*" in
+        '-6 -o addr show'*) printf '%s\n' '2: eth0    inet6 2a14:6781:000a:0000::9/64 scope global' ;;
+        '-6 route show table all') printf '%s\n' '::/0 via fe80::1 dev eth0 metric 1024' ;;
+        *) printf '%s\n' '2001:4860:4860::8888 via fe80::1 dev eth0 src 2a14:6781:a::9 metric 1024' ;;
+    esac
+}
+select_qemu_ipv6_subnet
+if [[ "$QEMU_IPV6_SUBNET" != 'fd42:122::/64' ]]; then
+    printf 'legacy public state was not migrated to the ULA subnet: %s\n' "$QEMU_IPV6_SUBNET" >&2
+    exit 1
+fi
 if ! host_has_ipv6_default_route; then
     printf 'a usable IPv6 route with a global source was rejected\n' >&2
     exit 1

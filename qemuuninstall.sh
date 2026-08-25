@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/qemu
-# 2026.03.02
+# 2026.08.26
 # 完整卸载 QEMU/KVM 环境及所有虚拟机
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
@@ -125,6 +125,9 @@ fi
 
 if command -v ip6tables >/dev/null 2>&1; then
     qemu_ipv6_subnet="fd42:122::/64"
+    if [[ -s /usr/local/bin/qemu_ipv6_subnet ]]; then
+        qemu_ipv6_subnet=$(tr -d '[:space:]' </usr/local/bin/qemu_ipv6_subnet 2>/dev/null || true)
+    fi
     ip6tables -t nat -D POSTROUTING -s "$qemu_ipv6_subnet" ! -d "$qemu_ipv6_subnet" -j MASQUERADE 2>/dev/null || true
     ip6tables -D FORWARD -d "$qemu_ipv6_subnet" -j ACCEPT 2>/dev/null || true
     ip6tables -D FORWARD -s "$qemu_ipv6_subnet" -j ACCEPT 2>/dev/null || true
@@ -239,6 +242,7 @@ for f in \
     /usr/local/bin/qemu_bridge \
     /usr/local/bin/qemu_ipv6_enabled \
     /usr/local/bin/qemu_ipv6_nat_enabled \
+    /usr/local/bin/qemu_ipv6_subnet \
     /usr/local/bin/qemu_main_interface \
     /usr/local/bin/qemu_db_file \
     /usr/local/bin/qemu_fw_backend \

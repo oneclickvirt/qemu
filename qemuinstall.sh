@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/qemu
-# 2026.03.02
+# 2026.08.26
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -33,6 +33,154 @@ QEMU_IPV6_SUBNET="fd42:122::/64"
 QEMU_IPV6_GATEWAY="fd42:122::1"
 QEMU_IPV6_DHCP_START="fd42:122::100"
 QEMU_IPV6_DHCP_END="fd42:122::1ff"
+QEMU_STATE_DIR="${QEMU_STATE_DIR:-/usr/local/bin}"
+QEMU_IPV6_NETWORK_READY=false
+
+qemu_ipv6_subnet_overlaps_host() {
+    local subnet="$1"
+    command -v python3 >/dev/null 2>&1 || return 2
+    {
+        ip -6 -o addr show 2>/dev/null | awk '$0 !~ / tentative/ {print $4}'
+        ip -6 route show table all 2>/dev/null | awk '$1 ~ /^[0-9A-Fa-f:]+\/[0-9]+$/ {print $1}'
+    } | python3 -c '
+import ipaddress
+import sys
+try:
+    candidate = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(2)
+for raw in sys.stdin:
+    try:
+        existing = ipaddress.IPv6Network(raw.strip(), strict=False)
+    except ValueError:
+        continue
+    if existing.prefixlen == 0:
+        continue
+    if candidate.overlaps(existing):
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$subnet"
+}
+
+qemu_ipv6_candidate() {
+    local index="$1"
+    python3 - "$index" <<'PY'
+import ipaddress
+import sys
+base = ipaddress.IPv6Network("fd42:122::/48")
+index = int(sys.argv[1])
+print(ipaddress.IPv6Network((int(base.network_address) + (index << 64), 64)))
+PY
+}
+
+qemu_ipv6_candidate_is_safe() {
+    local candidate="$1" allow_virbr0="${2:-false}" host_state
+    command -v python3 >/dev/null 2>&1 || return 1
+    host_state="$(
+        {
+            ip -6 -o addr show 2>/dev/null || true
+            ip -6 route show table all 2>/dev/null || true
+        }
+    )"
+    python3 - "$candidate" "$allow_virbr0" "$host_state" <<'PY' >/dev/null 2>&1
+import ipaddress
+import sys
+
+try:
+    candidate = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(1)
+if candidate.prefixlen != 64 or not candidate.subnet_of(ipaddress.IPv6Network("fc00::/7")):
+    raise SystemExit(1)
+allow_virbr0 = sys.argv[2] == "true"
+route_types = {"unreachable", "prohibit", "blackhole", "throw", "local", "broadcast", "anycast", "multicast"}
+for line in sys.argv[3].splitlines():
+    fields = line.split()
+    if not fields:
+        continue
+    if "inet6" in fields:
+        address_index = fields.index("inet6") + 1
+        if address_index >= len(fields):
+            continue
+        token = fields[address_index]
+        device = fields[1].split("@", 1)[0] if len(fields) > 1 else ""
+    else:
+        destination_index = 1 if fields[0] in route_types else 0
+        if destination_index >= len(fields):
+            continue
+        token = fields[destination_index]
+        if token == "default":
+            continue
+        device = ""
+        if "dev" in fields:
+            device_index = fields.index("dev") + 1
+            if device_index < len(fields):
+                device = fields[device_index].split("@", 1)[0]
+    try:
+        existing = ipaddress.IPv6Network(token, strict=False)
+    except ValueError:
+        continue
+    if existing.prefixlen == 0:
+        continue
+    if candidate.overlaps(existing):
+        # A persisted range is already installed by libvirt on virbr0 as a
+        # connected /64 plus a local gateway /128. Reusing that exact range
+        # is safe; a host or uplink route is not.
+        if allow_virbr0 and device == "virbr0" and existing.subnet_of(candidate):
+            continue
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+select_qemu_ipv6_subnet() {
+    local state_file="${QEMU_STATE_DIR%/}/qemu_ipv6_subnet" candidate index selected=false
+    if [[ -s "$state_file" ]]; then
+        candidate=$(tr -d '[:space:]' <"$state_file" 2>/dev/null || true)
+        if qemu_ipv6_candidate_is_safe "$candidate" true; then
+            QEMU_IPV6_SUBNET="$candidate"
+            selected=true
+        fi
+    fi
+    if [[ "$selected" != true ]] && qemu_ipv6_candidate_is_safe "$QEMU_IPV6_SUBNET" false; then
+        selected=true
+    fi
+    if [[ "$selected" != true ]]; then
+        for index in $(seq 0 255); do
+            candidate=$(qemu_ipv6_candidate "$index" 2>/dev/null || true)
+            [[ -n "$candidate" ]] || continue
+            qemu_ipv6_candidate_is_safe "$candidate" false || continue
+            QEMU_IPV6_SUBNET="$candidate"
+            selected=true
+            break
+        done
+    fi
+    [[ "$selected" == true ]] || return 1
+    QEMU_IPV6_GATEWAY="${QEMU_IPV6_SUBNET%/*}"
+    QEMU_IPV6_GATEWAY="$(python3 - "$QEMU_IPV6_GATEWAY" <<'PY'
+import ipaddress
+import sys
+network = ipaddress.IPv6Network(sys.argv[1] + "/64", strict=False)
+print(ipaddress.IPv6Address(int(network.network_address) + 1))
+PY
+)"
+    QEMU_IPV6_DHCP_START="$(python3 - "$QEMU_IPV6_GATEWAY" <<'PY'
+import ipaddress
+import sys
+print(ipaddress.IPv6Address(int(ipaddress.IPv6Address(sys.argv[1])) + 0xff))
+PY
+)"
+    QEMU_IPV6_DHCP_END="$(python3 - "$QEMU_IPV6_GATEWAY" <<'PY'
+import ipaddress
+import sys
+print(ipaddress.IPv6Address(int(ipaddress.IPv6Address(sys.argv[1])) + 0x1ff))
+PY
+)"
+    mkdir -p "$QEMU_STATE_DIR"
+    printf '%s\n' "$QEMU_IPV6_SUBNET" >"$state_file"
+    QEMU_IPV6_NETWORK_READY=true
+    return 0
+}
 
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
@@ -320,6 +468,13 @@ configure_storage_pool() {
 # ======== 配置 libvirt 默认 NAT 网络 ========
 configure_default_network() {
     _yellow "Configuring default NAT network..."
+    local ipv6_network_ready=false ipv6_network_xml=""
+    if ! select_qemu_ipv6_subnet; then
+        _yellow "No host-disjoint ULA IPv6 range is available; libvirt IPv6 NAT will remain disabled"
+    else
+        ipv6_network_ready=true
+        ipv6_network_xml=$(qemu_ipv6_network_xml)
+    fi
     # 检查 default 网络是否存在
     if ! virsh net-info default >/dev/null 2>&1; then
         if ip link show virbr0 >/dev/null 2>&1; then
@@ -350,11 +505,7 @@ configure_default_network() {
       <range start='192.168.122.100' end='192.168.122.254'/>
     </dhcp>
   </ip>
-  <ip family='ipv6' address='${QEMU_IPV6_GATEWAY}' prefix='64'>
-    <dhcp>
-      <range start='${QEMU_IPV6_DHCP_START}' end='${QEMU_IPV6_DHCP_END}'/>
-    </dhcp>
-  </ip>
+${ipv6_network_xml}
 </network>
 NETEOF
         virsh net-define /tmp/qemu-default-net.xml 2>/dev/null || true
@@ -369,7 +520,8 @@ NETEOF
         virsh net-autostart default 2>/dev/null || true
         _green "  ✓ Default NAT network is running"
     fi
-    if ! ensure_default_network_ipv6; then
+    if [[ "$ipv6_network_ready" == true ]] && ! ensure_default_network_ipv6; then
+        QEMU_IPV6_NETWORK_READY=false
         _yellow "  IPv6 NAT will stay disabled until the default network has ${QEMU_IPV6_SUBNET}"
     fi
     # 保存网络网桥名
@@ -453,7 +605,7 @@ configure_firewall() {
     _yellow "Configuring firewall rules..."
     local ipv6_nat_enabled=false
     local ipv6_nat_requested=false
-    if host_has_ipv6_default_route && default_network_has_qemu_ipv6 && ipv6_forwarding_enabled; then
+    if [[ "$QEMU_IPV6_NETWORK_READY" == true ]] && host_has_ipv6_default_route && default_network_has_qemu_ipv6 && ipv6_forwarding_enabled; then
         ipv6_nat_requested=true
     else
         _yellow "IPv6 NAT prerequisites are incomplete (route, managed ULA network, or forwarding); NAT66 is disabled"
@@ -695,7 +847,7 @@ main() {
     _blue "======================================================"
     _blue "  QEMU/KVM 虚拟机运行时一键安装脚本"
     _blue "  from https://github.com/oneclickvirt/qemu"
-    _blue "  2026.03.02"
+    _blue "  2026.08.26"
     _blue "======================================================"
     echo
 

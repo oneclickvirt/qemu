@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/qemu
-# 2026.03.02
+# 2026.08.26
 
 # Usage:
 # ./oneqemu.sh <name> <cpu> <memory_mb> <disk_gb> <password> <sshport> <startport> <endport> [system]
@@ -45,6 +45,9 @@ LOCK_DIR="/tmp/qemu-vm-state.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 RESERVATION_FILE="/tmp/qemu-vm-reservations"
 QEMU_IPV6_SUBNET="fd42:122::/64"
+if [[ -s /usr/local/bin/qemu_ipv6_subnet ]]; then
+    QEMU_IPV6_SUBNET=$(tr -d '[:space:]' </usr/local/bin/qemu_ipv6_subnet 2>/dev/null || true)
+fi
 lock_acquired=false
 state_lock_depth=0
 
