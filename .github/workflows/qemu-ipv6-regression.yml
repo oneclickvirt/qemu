@@ -1,4 +1,4 @@
-name: Static Checks
+name: QEMU IPv6 Regression
 
 on:
   push:
