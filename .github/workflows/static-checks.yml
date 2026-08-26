@@ -21,6 +21,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends shellcheck
+
       - name: Bash syntax check
         shell: bash
         run: |
@@ -29,15 +34,11 @@ jobs:
             bash -n "$file"
           done
 
-      - name: Optional ShellCheck
+      - name: ShellCheck
         shell: bash
         run: |
           set -euo pipefail
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck qemuinstall.sh qemuuninstall.sh scripts/*.sh
-          else
-            echo "shellcheck not available on runner; bash syntax check already completed"
-          fi
+          shellcheck -- qemuinstall.sh qemuuninstall.sh scripts/*.sh
 
       - name: Secret pattern scan
         shell: bash
