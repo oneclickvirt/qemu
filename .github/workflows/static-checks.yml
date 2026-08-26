@@ -40,6 +40,12 @@ jobs:
           set -euo pipefail
           shellcheck -- qemuinstall.sh qemuuninstall.sh scripts/*.sh
 
+      - name: Run IPv6 NAT regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/test_ipv6_nat.sh
+
       - name: Secret pattern scan
         shell: bash
         run: |
