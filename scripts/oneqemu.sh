@@ -760,17 +760,23 @@ download_cloud_image() {
                 [[ -s "$xz_path" ]] && dl_ok=true
         fi
         if [[ "$dl_ok" != true ]]; then
-            curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
-                -o "$xz_path" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "$xz_path" ]] && dl_ok=true || true
+            if curl -fL --progress-bar --connect-timeout 15 --max-time 600 \
+                -o "$xz_path" "$CLOUD_IMG_URL" 2>/dev/null && [[ -s "$xz_path" ]]; then
+                dl_ok=true
+            fi
         fi
         if [[ "$dl_ok" = true ]]; then
             _yellow "Decompressing image..."
             if xz -d "$xz_path" 2>/dev/null; then
                 local decompressed="${xz_path%.xz}"
-                [[ "$decompressed" != "$img_path" ]] && mv "$decompressed" "$img_path" 2>/dev/null || true
+                if [[ "$decompressed" != "$img_path" ]]; then
+                    mv "$decompressed" "$img_path" 2>/dev/null || true
+                fi
             elif unxz "$xz_path" 2>/dev/null; then
                 local decompressed="${xz_path%.xz}"
-                [[ "$decompressed" != "$img_path" ]] && mv "$decompressed" "$img_path" 2>/dev/null || true
+                if [[ "$decompressed" != "$img_path" ]]; then
+                    mv "$decompressed" "$img_path" 2>/dev/null || true
+                fi
             fi
             if [[ -f "$img_path" ]] && [[ -s "$img_path" ]]; then
                 write_image_checksum "$img_path"

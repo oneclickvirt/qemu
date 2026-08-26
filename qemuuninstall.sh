@@ -190,8 +190,9 @@ case $SYSTEM in
             qemu-kvm qemu-system libvirt-daemon-system libvirt-clients virtinst \
             qemu-utils cloud-image-utils bridge-utils 2>/dev/null || true
         # 仅在已安装时才卸载 iptables-persistent
-        dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii" && \
+        if dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii"; then
             apt-get remove -y --purge iptables-persistent netfilter-persistent 2>/dev/null || true
+        fi
         apt-get autoremove -y 2>/dev/null || true
         ;;
     CentOS|Fedora)
