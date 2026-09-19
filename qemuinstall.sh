@@ -17,6 +17,23 @@ is_truthy() {
     esac
 }
 
+normalize_noninteractive() {
+    local selected=""
+    if [[ -v noninteractive ]]; then
+        selected="$noninteractive"
+    else
+        selected="${NONINTERACTIVE:-}"
+    fi
+    case "$(printf '%s' "$selected" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) noninteractive=true ;;
+        0|false|no|n|"") noninteractive=false ;;
+        *) noninteractive=false ;;
+    esac
+    export noninteractive NONINTERACTIVE="$noninteractive"
+}
+
+normalize_noninteractive
+
 is_noninteractive() {
     is_truthy "${noninteractive:-}" || [[ ! -t 0 ]]
 }
@@ -26,7 +43,7 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 if [ ! -d /usr/local/bin ]; then
-    mkdir -p /usr/local/bin
+    mkdir -p /usr/local/bin || exit 1
 fi
 
 QEMU_IPV6_SUBNET="fd42:122::/64"
@@ -183,10 +200,10 @@ PY
 }
 
 # ======== 系统检测 ========
-REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
+REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "amazon[[:space:]]+linux" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
 PACKAGE_UPDATE=(
-    "! apt-get update && apt-get --fix-broken install -y && apt-get update"
+    "apt-get update || { apt-get --fix-broken install -y && apt-get update; }"
     "apt-get update"
     "yum -y update"
     "yum -y update"
@@ -365,19 +382,22 @@ install_base_deps() {
     _yellow "Installing base dependencies..."
     case $SYSTEM in
         Debian|Ubuntu)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz-utils dnsmasq-base genisoimage sshpass 2>/dev/null || true
+                socat unzip tar jq xz-utils dnsmasq-base genisoimage sshpass 2>/dev/null || return 1
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute \
-                socat unzip tar jq xz dnsmasq genisoimage sshpass 2>/dev/null || true
+                socat unzip tar jq xz dnsmasq genisoimage sshpass 2>/dev/null || return 1
             ;;
         Alpine)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz cdrkit sshpass 2>/dev/null || true
+                socat unzip tar jq xz cdrkit sshpass 2>/dev/null || return 1
             ;;
+        *)
+            _red "Unsupported package manager for QEMU prerequisites"
+            return 1
     esac
     _green "Base dependencies installed"
 }
@@ -387,7 +407,7 @@ install_qemu_stack() {
     _yellow "Installing QEMU/KVM + libvirt stack..."
     case $SYSTEM in
         Debian|Ubuntu)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} \
                 qemu-kvm \
                 qemu-system \
@@ -400,7 +420,7 @@ install_qemu_stack() {
                 net-tools \
                 sqlite3 \
                 nftables \
-                2>/dev/null || true
+                2>/dev/null || return 1
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} \
@@ -414,10 +434,10 @@ install_qemu_stack() {
                 net-tools \
                 sqlite \
                 nftables \
-                2>/dev/null || true
+                2>/dev/null || return 1
             ;;
         Alpine)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} \
                 qemu-system-x86_64 \
                 qemu-img \
@@ -425,8 +445,11 @@ install_qemu_stack() {
                 libvirt-client \
                 virt-install \
                 bridge \
-                2>/dev/null || true
+                2>/dev/null || return 1
             ;;
+        *)
+            _red "Unsupported package manager for QEMU stack"
+            return 1
     esac
     _green "QEMU/KVM stack installed"
 }
@@ -435,34 +458,41 @@ install_qemu_stack() {
 start_libvirtd() {
     _yellow "Starting libvirtd service..."
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable libvirtd 2>/dev/null || systemctl enable libvirt-daemon 2>/dev/null || true
-        systemctl start libvirtd 2>/dev/null || systemctl start libvirt-daemon 2>/dev/null || true
+        systemctl enable libvirtd 2>/dev/null || systemctl enable libvirt-daemon 2>/dev/null || return 1
+        systemctl start libvirtd 2>/dev/null || systemctl start libvirt-daemon 2>/dev/null || return 1
         sleep 2
         if systemctl is-active --quiet libvirtd 2>/dev/null || systemctl is-active --quiet libvirt-daemon 2>/dev/null; then
             _green "  ✓ libvirtd is running"
         else
-            _yellow "  ⚠ libvirtd may not be running properly"
+            _red "libvirtd is not active"
+            return 1
         fi
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-update add libvirtd default >/dev/null 2>&1 || true
+        rc-service libvirtd start >/dev/null 2>&1 || return 1
+    else
+        _red "No supported service manager found for libvirtd"
+        return 1
     fi
+    virsh -c qemu:///system list --all >/dev/null 2>&1 || return 1
 }
 
 # ======== 配置 libvirt 默认存储池 ========
 configure_storage_pool() {
     _yellow "Configuring default storage pool..."
-    local pool_path="${qemu_images_path:-/var/lib/libvirt/images}"
-    mkdir -p "$pool_path"
+    local pool_path="${qemu_images_path:-/var/lib/libvirt/images}" active
+    mkdir -p "$pool_path" || return 1
     if ! virsh pool-info default >/dev/null 2>&1; then
-        virsh pool-define-as default dir --target "$pool_path" 2>/dev/null || true
-        virsh pool-start default 2>/dev/null || true
-        virsh pool-autostart default 2>/dev/null || true
+        virsh pool-define-as default dir --target "$pool_path" || return 1
         _green "  ✓ Default storage pool created"
     else
-        if ! virsh pool-list --all 2>/dev/null | grep -q "default.*active"; then
-            virsh pool-start default 2>/dev/null || true
-            virsh pool-autostart default 2>/dev/null || true
-        fi
         _green "  ✓ Default storage pool is ready"
     fi
+    active=$(virsh pool-list --name) || return 1
+    if ! grep -Fxq default <<< "$active"; then
+        virsh pool-start default || return 1
+    fi
+    virsh pool-autostart default || return 1
 }
 
 # ======== 配置 libvirt 默认 NAT 网络 ========
@@ -508,16 +538,18 @@ configure_default_network() {
 ${ipv6_network_xml}
 </network>
 NETEOF
-        virsh net-define /tmp/qemu-default-net.xml 2>/dev/null || true
+        virsh net-define /tmp/qemu-default-net.xml || return 1
         rm -f /tmp/qemu-default-net.xml
         _green "  ✓ Default NAT network defined"
     fi
-    if ! virsh net-list --all 2>/dev/null | grep -q "default.*active"; then
-        virsh net-start default 2>/dev/null || true
-        virsh net-autostart default 2>/dev/null || true
+    local active
+    active=$(virsh net-list --name) || return 1
+    if ! grep -Fxq default <<< "$active"; then
+        virsh net-start default || return 1
+        virsh net-autostart default || return 1
         _green "  ✓ Default NAT network started"
     else
-        virsh net-autostart default 2>/dev/null || true
+        virsh net-autostart default || return 1
         _green "  ✓ Default NAT network is running"
     fi
     if [[ "$ipv6_network_ready" == true ]] && ! ensure_default_network_ipv6; then
@@ -526,22 +558,26 @@ NETEOF
     fi
     # 保存网络网桥名
     local bridge_name
-    bridge_name=$(virsh net-dumpxml default 2>/dev/null | grep '<bridge' | grep -oP 'name="\K[^"]+' || echo "virbr0")
-    echo "$bridge_name" > /usr/local/bin/qemu_bridge
+    bridge_name=$(virsh net-dumpxml default | sed -nE "s/.*<bridge[[:space:]][^>]*name=['\"]([^'\"]+)['\"].*/\1/p") || return 1
+    if [[ -z "$bridge_name" || "$bridge_name" == *$'\n'* ]]; then
+        _red "Could not determine the default network bridge"
+        return 1
+    fi
+    echo "$bridge_name" > "${QEMU_STATE_DIR%/}/qemu_bridge" || return 1
     _green "  ✓ Bridge interface: $bridge_name"
 }
 
 # ======== 配置 libvirt hooks 目录 ========
 configure_hooks() {
     _yellow "Configuring libvirt hooks..."
-    mkdir -p /etc/libvirt/hooks
+    mkdir -p /etc/libvirt/hooks || return 1
     if [ ! -f /etc/libvirt/hooks/qemu ]; then
         cat > /etc/libvirt/hooks/qemu <<'HOOKEOF'
 #!/bin/bash
 # libvirt qemu hook - managed by oneclickvirt/qemu
 # DO NOT EDIT MANUALLY
 HOOKEOF
-        chmod +x /etc/libvirt/hooks/qemu
+        chmod +x /etc/libvirt/hooks/qemu || return 1
         _green "  ✓ libvirt qemu hook initialized"
     else
         _green "  ✓ libvirt qemu hook already exists"
@@ -553,10 +589,12 @@ ipv6_forwarding_enabled() {
 }
 
 configure_ipv6_nat_nft() {
-    nft add table ip6 qemu6 2>/dev/null || true
+    nft add table ip6 qemu6 2>/dev/null || nft list table ip6 qemu6 >/dev/null 2>&1 || return 1
     nft list table ip6 qemu6 >/dev/null 2>&1 || return 1
-    nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-    nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+    nft 'add chain ip6 qemu6 postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null ||
+        nft list chain ip6 qemu6 postrouting >/dev/null 2>&1 || return 1
+    nft 'add chain ip6 qemu6 forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null ||
+        nft list chain ip6 qemu6 forward >/dev/null 2>&1 || return 1
 
     local postrouting forward
     postrouting=$(nft list chain ip6 qemu6 postrouting 2>/dev/null) || return 1
@@ -614,18 +652,21 @@ configure_firewall() {
         echo "nft" > /usr/local/bin/qemu_fw_backend
         _green "  Using nftables backend"
         # Create dedicated qemu nft table for port forwarding
-        nft add table ip qemu 2>/dev/null || true
-        nft 'add chain ip qemu prerouting { type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-        nft 'add chain ip qemu postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-        nft 'add chain ip qemu forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+        nft add table ip qemu 2>/dev/null || nft list table ip qemu >/dev/null 2>&1 || return 1
+        nft 'add chain ip qemu prerouting { type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null ||
+            nft list chain ip qemu prerouting >/dev/null 2>&1 || return 1
+        nft 'add chain ip qemu postrouting { type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null ||
+            nft list chain ip qemu postrouting >/dev/null 2>&1 || return 1
+        nft 'add chain ip qemu forward { type filter hook forward priority 0; policy accept; }' 2>/dev/null ||
+            nft list chain ip qemu forward >/dev/null 2>&1 || return 1
         # Add base rules (idempotent)
         if ! nft list chain ip qemu postrouting 2>/dev/null | grep -q masquerade; then
-            nft add rule ip qemu postrouting ip saddr 192.168.122.0/24 ip daddr != 192.168.122.0/24 masquerade 2>/dev/null || true
+            nft add rule ip qemu postrouting ip saddr 192.168.122.0/24 ip daddr != 192.168.122.0/24 masquerade 2>/dev/null || return 1
         fi
         if ! nft list chain ip qemu forward 2>/dev/null | grep -q "ct state"; then
-            nft add rule ip qemu forward ct state established,related accept 2>/dev/null || true
-            nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || true
-            nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || true
+            nft add rule ip qemu forward ct state established,related accept 2>/dev/null || return 1
+            nft add rule ip qemu forward ip daddr 192.168.122.0/24 accept 2>/dev/null || return 1
+            nft add rule ip qemu forward ip saddr 192.168.122.0/24 accept 2>/dev/null || return 1
         fi
         if [[ "$ipv6_nat_requested" == true ]]; then
             if configure_ipv6_nat_nft; then
@@ -635,7 +676,7 @@ configure_firewall() {
             fi
         fi
         # Persist nft rules
-        mkdir -p /etc/nftables.d
+        mkdir -p /etc/nftables.d || return 1
         {
             echo "# QEMU VM port forwarding - managed by oneclickvirt/qemu"
             echo "table ip qemu"
@@ -646,11 +687,17 @@ configure_firewall() {
                 echo "delete table ip6 qemu6"
                 nft list table ip6 qemu6
             fi
-        } > /etc/nftables.d/qemu.nft
-        if [[ -f /etc/nftables.conf ]] \
-            && ! grep -qF 'include "/etc/nftables.d/qemu.nft"' /etc/nftables.conf 2>/dev/null \
-            && ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
-            echo 'include "/etc/nftables.d/qemu.nft"' >> /etc/nftables.conf
+        } > /etc/nftables.d/qemu.nft || return 1
+        if [[ -f /etc/nftables.conf ]]; then
+            if ! grep -qF 'include "/etc/nftables.d/qemu.nft"' /etc/nftables.conf 2>/dev/null \
+                && ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
+                echo 'include "/etc/nftables.d/qemu.nft"' >> /etc/nftables.conf || return 1
+            fi
+        else
+            cat > /etc/nftables.conf <<'NFTEOF' || return 1
+#!/usr/sbin/nft -f
+include "/etc/nftables.d/qemu.nft"
+NFTEOF
         fi
         systemctl enable nftables 2>/dev/null || true
         _green "  ✓ nftables qemu table initialized"
@@ -659,13 +706,13 @@ configure_firewall() {
         _green "  Using iptables backend (nft not available)"
         # IPv4 base rules
         iptables -t nat -C POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || \
-            iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || true
+            iptables -t nat -I POSTROUTING -s 192.168.122.0/24 ! -d 192.168.122.0/24 -j MASQUERADE 2>/dev/null || return 1
         iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || return 1
         iptables -C FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD -d 192.168.122.0/24 -j ACCEPT 2>/dev/null || return 1
         iptables -C FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD -s 192.168.122.0/24 -j ACCEPT 2>/dev/null || return 1
         if [[ "$ipv6_nat_requested" == true ]]; then
             if configure_ipv6_nat_iptables; then
                 ipv6_nat_enabled=true
@@ -687,9 +734,11 @@ configure_firewall() {
         fi
         
         # Save rules (both v4 and v6)
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        mkdir -p /etc/iptables || return 1
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
+        fi
         # Also save for CentOS/Fedora
         service iptables save 2>/dev/null || true
         service ip6tables save 2>/dev/null || true
@@ -723,15 +772,20 @@ EOF
     else
         ipv6_uplink=""
     fi
-    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-qemu.conf >/dev/null 2>&1 || true
+    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-qemu.conf >/dev/null 2>&1 || return 1
     if [[ -n "$ipv6_uplink" ]]; then
         sysctl -w "net.ipv6.conf.${ipv6_uplink}.accept_ra=2" >/dev/null 2>&1 || true
+    fi
+    if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]]; then
+        _red "IPv4 forwarding could not be enabled"
+        return 1
     fi
     if ipv6_forwarding_enabled; then
         _green "IP forwarding enabled"
     else
         _yellow "IPv6 forwarding could not be enabled; NAT66 will remain disabled"
     fi
+    return 0
 }
 
 # ======== 检测公网 IPv4 ========
@@ -741,7 +795,11 @@ detect_interface() {
     if [[ -z "$iface" ]]; then
         iface=$(ip link show | awk '/^[0-9]+: / && !/lo:/{gsub(":", "", $2); print $2; exit}')
     fi
-    echo "$iface" > /usr/local/bin/qemu_main_interface
+    if [[ -z "$iface" ]]; then
+        _red "Could not determine a host network interface for QEMU"
+        return 1
+    fi
+    echo "$iface" > /usr/local/bin/qemu_main_interface || return 1
     _green "Main network interface: $iface"
 }
 
@@ -839,7 +897,13 @@ verify_install() {
         _green "All components installed successfully"
     else
         _yellow "Some components missing, please check manually"
+        return 1
     fi
+    local active
+    active=$(virsh pool-list --name) || return 1
+    grep -Fxq default <<< "$active" || { _red "Default storage pool is inactive"; return 1; }
+    active=$(virsh net-list --name) || return 1
+    grep -Fxq default <<< "$active" || { _red "Default network is inactive"; return 1; }
 }
 
 # ======== 主流程 ========
@@ -875,29 +939,32 @@ main() {
     if [ -z "$qemu_images_path" ]; then
         qemu_images_path="/var/lib/libvirt/images"
     fi
-    mkdir -p "$qemu_images_path"
-    echo "$qemu_images_path" > /usr/local/bin/qemu_images_path
+    mkdir -p "$qemu_images_path" || {
+        _red "Unable to create QEMU image path: $qemu_images_path"
+        return 1
+    }
+    echo "$qemu_images_path" > /usr/local/bin/qemu_images_path || return 1
 
     check_cdn_file
     echo "$cdn_success_url" > /usr/local/bin/qemu_cdn
 
     check_kvm_support
-    install_base_deps
-    install_qemu_stack
-    start_libvirtd
-    configure_storage_pool
-    configure_default_network
-    configure_hooks
-    configure_sysctl
-    configure_firewall
-    detect_interface
+    install_base_deps || return 1
+    install_qemu_stack || return 1
+    start_libvirtd || return 1
+    configure_storage_pool || return 1
+    configure_default_network || return 1
+    configure_hooks || return 1
+    configure_sysctl || return 1
+    configure_firewall || return 1
+    detect_interface || return 1
     check_ipv6
-    init_database
+    init_database || return 1
 
     # 保存架构信息
     echo "$ARCH_TYPE" > /usr/local/bin/qemu_arch
 
-    verify_install
+    verify_install || return 1
 
     local fw_info
     if [[ -f /usr/local/bin/qemu_fw_backend ]]; then

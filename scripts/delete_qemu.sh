@@ -19,6 +19,23 @@ is_truthy() {
     esac
 }
 
+normalize_noninteractive() {
+    local selected=""
+    if [[ -v noninteractive ]]; then
+        selected="$noninteractive"
+    else
+        selected="${NONINTERACTIVE:-}"
+    fi
+    case "$(printf '%s' "$selected" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) noninteractive=true ;;
+        0|false|no|n|"") noninteractive=false ;;
+        *) noninteractive=false ;;
+    esac
+    export noninteractive NONINTERACTIVE="$noninteractive"
+}
+
+normalize_noninteractive
+
 LOCK_DIR="/tmp/qemu-vm-state.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 lock_acquired=false

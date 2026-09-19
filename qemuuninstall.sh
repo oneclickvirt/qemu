@@ -16,6 +16,23 @@ is_truthy() {
     esac
 }
 
+normalize_noninteractive() {
+    local selected=""
+    if [[ -v noninteractive ]]; then
+        selected="$noninteractive"
+    else
+        selected="${NONINTERACTIVE:-}"
+    fi
+    case "$(printf '%s' "$selected" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on) noninteractive=true ;;
+        0|false|no|n|"") noninteractive=false ;;
+        *) noninteractive=false ;;
+    esac
+    export noninteractive NONINTERACTIVE="$noninteractive"
+}
+
+normalize_noninteractive
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root"
     exit 1
