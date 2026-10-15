@@ -650,10 +650,17 @@ try_pve_kvm_images() {
 
     _yellow "Trying oneclickvirt/pve_kvm_images for ${ver}..."
 
+    local maintained_ver="$ver"
+    case "$ver" in
+        ubuntu[0-9][0-9]) maintained_ver="${ver}04" ;;
+        centos8-stream) maintained_ver="centos8" ;;
+        centos9-stream) maintained_ver="centos9" ;;
+    esac
+
     # 直接按已知 URL 模式尝试，不依赖 GitHub API
     # 优先使用 tag=<sys> 的系统专项 release，次优先使用 tag=images 的通用 release
     local candidate_urls=(
-        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${ver}.qcow2"
+        "https://github.com/oneclickvirt/pve_kvm_images/releases/download/${sys}/${maintained_ver}.qcow2"
         "https://github.com/oneclickvirt/pve_kvm_images/releases/download/images/${ver}.qcow2"
     )
 
@@ -683,13 +690,20 @@ try_pve_kvm_images() {
 }
 
 # 尝试从 oneclickvirt/kvm_images 下载（第二优先级）
-# 该仓库手动维护，release tag = ver，文件名 = ${ver}.qcow2
+# 手工仓使用版本化 release tag，文件名仍为 ${ver}.qcow2
 try_kvm_images() {
     local ver="$1"       # e.g. debian12
     local img_path="$2"
 
     _yellow "Trying oneclickvirt/kvm_images for ${ver}..."
-    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${ver}/${ver}.qcow2"
+    local release_tag
+    case "$ver" in
+        fedora34|almalinux8|debian11|debian12|ubuntu18|ubuntu20|ubuntu22|centos7|alpinelinux_edge|alpinelinux_stable|rockylinux8) release_tag="v2.0" ;;
+        debian10|debian9) release_tag="v1.1" ;;
+        archlinux|fedora33|opensuse-leap-15) release_tag="v1.0" ;;
+        *) return 1 ;;
+    esac
+    local base_url="https://github.com/oneclickvirt/kvm_images/releases/download/${release_tag}/${ver}.qcow2"
     local url="${cdn_success_url}${base_url}"
     if curl -fL --progress-bar --connect-timeout 30 --max-time 600 \
             -o "${img_path}.tmp" "$url" 2>/dev/null && [[ -s "${img_path}.tmp" ]]; then
@@ -733,10 +747,11 @@ download_cloud_image() {
 
     # ---- 1. 尝试组织预置镜像 ----
     # system 已包含版本（如 debian12），en_system 为名称部分（如 debian）
-    if try_pve_kvm_images "$system" "$img_path" "$en_system"; then
+    # Organization QCOW2 releases are x86_64; ARM must use its official image.
+    if [[ "$ARCH_TYPE" == "amd64" || "$ARCH_TYPE" == "x86_64" ]] && try_pve_kvm_images "$system" "$img_path" "$en_system"; then
         return 0
     fi
-    if try_kvm_images "$system" "$img_path"; then
+    if [[ "$ARCH_TYPE" == "amd64" || "$ARCH_TYPE" == "x86_64" ]] && try_kvm_images "$system" "$img_path"; then
         return 0
     fi
     _yellow "Org images unavailable, falling back to official upstream..."
