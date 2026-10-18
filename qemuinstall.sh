@@ -344,14 +344,66 @@ ensure_default_network_ipv6() {
     local xml
     xml=$(qemu_ipv6_network_xml)
     if ! virsh net-update default add ip "$xml" --live --config >/dev/null 2>&1; then
-        _yellow "Could not add the ULA IPv6 range to the existing default network; IPv4 networking remains available"
-        return 1
+        # libvirt does not support updating the top-level ip section on many
+        # versions. Redefine only when no running guest uses this network;
+        # never interrupt an existing guest just to enable optional IPv6.
+        redefine_idle_network_ipv6 "$xml" || {
+            _yellow "Could not add the ULA IPv6 range to the existing default network; IPv4 networking remains available"
+            return 1
+        }
     fi
     if ! default_network_has_qemu_ipv6; then
         _yellow "The default network did not retain the managed ULA IPv6 range; IPv6 NAT is disabled"
         return 1
     fi
     _green "  ✓ Default NAT network IPv6 range is ready: ${QEMU_IPV6_SUBNET}"
+}
+
+redefine_idle_network_ipv6() {
+    local ipv6_xml="$1" guests guest interfaces work
+    guests=$(virsh list --name 2>/dev/null) || return 1
+    while IFS= read -r guest; do
+        [ -n "$guest" ] || continue
+        interfaces=$(virsh domiflist "$guest" 2>/dev/null) || return 1
+        if printf '%s\n' "$interfaces" | awk '$2 == "network" && $3 == "default" {found=1} END {exit !found}'; then
+            return 1
+        fi
+    done <<< "$guests"
+    work=$(mktemp -d) || return 1
+    if ! virsh net-dumpxml default --inactive > "$work/original.xml"; then
+        rm -rf "$work"; return 1
+    fi
+    if ! python3 - "$work/original.xml" "$work/updated.xml" "$ipv6_xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+tree = ET.parse(sys.argv[1])
+root = tree.getroot()
+# Preserve administrator-defined IPv6 networks instead of adding ambiguity.
+if any(ip.get('family') == 'ipv6' for ip in root.findall('ip')):
+    raise SystemExit(1)
+root.append(ET.fromstring(sys.argv[3]))
+# libvirt otherwise installs IPv6 forwarding rejects for an IPv4-only NAT
+# network, even when a separate masquerade table has been configured.
+forward = root.find('forward')
+if forward is not None and forward.get('mode') == 'nat':
+    nat = forward.find('nat')
+    if nat is None:
+        nat = ET.SubElement(forward, 'nat')
+    nat.set('ipv6', 'yes')
+tree.write(sys.argv[2], encoding='unicode')
+PY
+    then
+        rm -rf "$work"; return 1
+    fi
+    if ! virsh net-define "$work/updated.xml" >/dev/null; then
+        rm -rf "$work"; return 1
+    fi
+    if ! virsh net-destroy default >/dev/null || ! virsh net-start default >/dev/null; then
+        virsh net-define "$work/original.xml" >/dev/null 2>&1 || true
+        virsh net-start default >/dev/null 2>&1 || true
+        rm -rf "$work"; return 1
+    fi
+    rm -rf "$work"
 }
 
 # ======== KVM 虚拟化支持检测 ========
@@ -384,16 +436,16 @@ install_base_deps() {
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz-utils dnsmasq-base genisoimage sshpass 2>/dev/null || return 1
+                socat unzip tar jq python3 xz-utils dnsmasq-base genisoimage sshpass 2>/dev/null || return 1
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute \
-                socat unzip tar jq xz dnsmasq genisoimage sshpass 2>/dev/null || return 1
+                socat unzip tar jq python3 xz dnsmasq genisoimage sshpass 2>/dev/null || return 1
             ;;
         Alpine)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || return 1
             ${PACKAGE_INSTALL[int]} curl ca-certificates nftables iptables iproute2 \
-                socat unzip tar jq xz cdrkit sshpass 2>/dev/null || return 1
+                socat unzip tar jq python3 xz cdrkit sshpass 2>/dev/null || return 1
             ;;
         *)
             _red "Unsupported package manager for QEMU prerequisites"
@@ -639,6 +691,49 @@ configure_ipv6_nat_iptables() {
 }
 
 # ======== 配置防火墙 ========
+install_libvirt_dnat_forwarding() {
+    local hook=/etc/libvirt/hooks/network.d/50-oneclickvirt-qemu-dnat
+    mkdir -p "$(dirname "$hook")" || return 1
+    local hook_tmp
+    hook_tmp=$(mktemp "${hook}.XXXXXX") || return 1
+    cat > "$hook_tmp" <<'OCVHOOK'
+#!/usr/bin/env bash
+# Managed by oneclickvirt: allow only traffic matching explicit DNAT mappings.
+set -euo pipefail
+if [[ "${1:-}" != --apply ]]; then
+    [[ "${1:-}" == default ]] || exit 0
+    case "${2:-}" in started|updated) ;; *) exit 0 ;; esac
+fi
+bridge=virbr0
+if [[ -s /usr/local/bin/qemu_bridge ]]; then
+    bridge=$(cat /usr/local/bin/qemu_bridge)
+fi
+[[ "$bridge" =~ ^[a-zA-Z0-9_.:-]+$ ]] || exit 1
+exec 9>/run/lock/oneclickvirt-qemu-dnat.lock
+flock -w 15 9 || exit 1
+if command -v iptables >/dev/null 2>&1 && iptables -w 10 -S LIBVIRT_FWI >/dev/null 2>&1; then
+    # libvirt may prepend its reject rules on DHCP updates. Reposition our
+    # exact owned exception instead of accepting a stale rule after reject.
+    while iptables -w 10 -C LIBVIRT_FWI -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT 2>/dev/null; do
+        iptables -w 10 -D LIBVIRT_FWI -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT
+    done
+    iptables -w 10 -I LIBVIRT_FWI 1 -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT
+fi
+if command -v nft >/dev/null 2>&1 && nft list chain ip libvirt_network guest_input >/dev/null 2>&1; then
+    handles=$(nft -a list chain ip libvirt_network guest_input | awk '/comment "oneclickvirt-qemu-dnat"/ {for (i=1; i<NF; i++) if ($i=="handle") print $(i+1)}')
+    while IFS= read -r handle; do
+        [[ -n "$handle" ]] || continue
+        [[ "$handle" =~ ^[0-9]+$ ]] || exit 1
+        nft delete rule ip libvirt_network guest_input handle "$handle"
+    done <<< "$handles"
+    nft insert rule ip libvirt_network guest_input oifname "$bridge" ip daddr 192.168.122.0/24 ct status dnat accept comment '"oneclickvirt-qemu-dnat"'
+fi
+OCVHOOK
+    chmod 0755 "$hook_tmp" || { rm -f "$hook_tmp"; return 1; }
+    mv -f "$hook_tmp" "$hook" || { rm -f "$hook_tmp"; return 1; }
+    bash "$hook" --apply
+}
+
 configure_firewall() {
     _yellow "Configuring firewall rules..."
     local ipv6_nat_enabled=false
@@ -945,17 +1040,19 @@ main() {
     }
     echo "$qemu_images_path" > /usr/local/bin/qemu_images_path || return 1
 
+    # A clean Debian installation need not provide curl yet.
+    install_base_deps || return 1
     check_cdn_file
     echo "$cdn_success_url" > /usr/local/bin/qemu_cdn
 
     check_kvm_support
-    install_base_deps || return 1
     install_qemu_stack || return 1
     start_libvirtd || return 1
     configure_storage_pool || return 1
     configure_default_network || return 1
     configure_hooks || return 1
     configure_sysctl || return 1
+    install_libvirt_dnat_forwarding || return 1
     configure_firewall || return 1
     detect_interface || return 1
     check_ipv6

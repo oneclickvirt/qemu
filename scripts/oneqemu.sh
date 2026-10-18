@@ -870,18 +870,25 @@ allocate_ip() {
 create_cloudinit_yaml() {
     local vm_name="$1"
     local password="$2"
-    local tmp_yaml="/tmp/qemu-cloudinit-${vm_name}.yaml"
-
-    cat > "$tmp_yaml" <<CIEOF
-#cloud-config
-hostname: ${vm_name}
-locale: en_US.UTF-8
+    local tmp_yaml
+    tmp_yaml=$(mktemp "/tmp/qemu-cloudinit-${vm_name}.XXXXXX.yaml") || return 1
+    if ! python3 - "$vm_name" "$password" > "$tmp_yaml" <<'PYCONFIG'
+import json
+import shlex
+import sys
+name, password = sys.argv[1:]
+password = password.replace("\r", "").replace("\n", "")
+password_command = "printf 'root:%s\\n' " + shlex.quote(password) + " | chpasswd"
+print("""#cloud-config
+hostname: %s
+locale: C.UTF-8
 disable_root: false
 ssh_pwauth: true
-chpasswd:
-  expire: false
-  list:
-    - root:${password}
+users:
+  - default
+  - name: root
+    lock_passwd: false
+    shell: /bin/bash
 write_files:
   - path: /etc/ssh/sshd_config.d/99-qemu.conf
     content: |
@@ -890,15 +897,20 @@ write_files:
       PubkeyAuthentication yes
 runcmd:
   - systemctl enable --now serial-getty@ttyS0.service 2>/dev/null || true
-  - echo 'root:${password}' | chpasswd
+  - %s
   - |
     if [ -f /etc/ssh/sshd_config ]; then
       sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
       sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
     fi
   - systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-final_message: "cloud-init done after \$UPTIME seconds"
-CIEOF
+final_message: "cloud-init done after $UPTIME seconds"
+""" % (json.dumps(name), json.dumps(password_command)))
+PYCONFIG
+    then
+        rm -f "$tmp_yaml"
+        return 1
+    fi
 
     echo "$tmp_yaml"
 }
@@ -915,6 +927,20 @@ check_cloudinit_support() {
 create_cloudinit_iso() {
     local vm_name="$1"
     local password="$2"
+    local vm_mac="$3" network_yaml
+    [[ "$vm_mac" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]] || return 1
+    network_yaml=$(mktemp "/tmp/qemu-network-${vm_name}.XXXXXX.yaml") || return 1
+    cat > "$network_yaml" <<NETEOF
+version: 2
+ethernets:
+  uplink:
+    match:
+      macaddress: "${vm_mac}"
+    dhcp4: true
+    dhcp6: true
+    accept-ra: true
+    optional: true
+NETEOF
     local tmp_yaml
     tmp_yaml=$(create_cloudinit_yaml "$vm_name" "$password")
     local tmp_iso="${images_path}/vm-${vm_name}-cloudinit.iso"
@@ -926,12 +952,13 @@ local-hostname: ${vm_name}
 METAEOF
 
     if command -v cloud-localds >/dev/null 2>&1; then
-        cloud-localds "$tmp_iso" "$tmp_yaml" "$meta_yaml"
+        cloud-localds --network-config="$network_yaml" "$tmp_iso" "$tmp_yaml" "$meta_yaml"
     elif command -v genisoimage >/dev/null 2>&1; then
         local ci_dir="/tmp/qemu-ci-${vm_name}"
         mkdir -p "$ci_dir"
         cp "$tmp_yaml" "$ci_dir/user-data"
         cp "$meta_yaml" "$ci_dir/meta-data"
+        cp "$network_yaml" "$ci_dir/network-config"
         genisoimage -output "$tmp_iso" -volid cidata -joliet -rock "$ci_dir" 2>/dev/null
         rm -rf "$ci_dir"
     elif command -v mkisofs >/dev/null 2>&1; then
@@ -939,6 +966,7 @@ METAEOF
         mkdir -p "$ci_dir"
         cp "$tmp_yaml" "$ci_dir/user-data"
         cp "$meta_yaml" "$ci_dir/meta-data"
+        cp "$network_yaml" "$ci_dir/network-config"
         mkisofs -output "$tmp_iso" -volid cidata -joliet -rock "$ci_dir" 2>/dev/null
         rm -rf "$ci_dir"
     else
@@ -947,7 +975,7 @@ METAEOF
         exit 1
     fi
 
-    rm -f "$tmp_yaml" "$meta_yaml"
+    rm -f "$tmp_yaml" "$meta_yaml" "$network_yaml"
     if [[ ! -s "$tmp_iso" ]]; then
         echo "ERROR: cloud-init ISO was not created: $tmp_iso" >&2
         exit 1
@@ -987,6 +1015,49 @@ detect_fw() {
             exit 1
         fi
     fi
+}
+
+install_libvirt_dnat_forwarding() {
+    local hook=/etc/libvirt/hooks/network.d/50-oneclickvirt-qemu-dnat
+    mkdir -p "$(dirname "$hook")" || return 1
+    local hook_tmp
+    hook_tmp=$(mktemp "${hook}.XXXXXX") || return 1
+    cat > "$hook_tmp" <<'OCVHOOK'
+#!/usr/bin/env bash
+# Managed by oneclickvirt: allow only traffic matching explicit DNAT mappings.
+set -euo pipefail
+if [[ "${1:-}" != --apply ]]; then
+    [[ "${1:-}" == default ]] || exit 0
+    case "${2:-}" in started|updated) ;; *) exit 0 ;; esac
+fi
+bridge=virbr0
+if [[ -s /usr/local/bin/qemu_bridge ]]; then
+    bridge=$(cat /usr/local/bin/qemu_bridge)
+fi
+[[ "$bridge" =~ ^[a-zA-Z0-9_.:-]+$ ]] || exit 1
+exec 9>/run/lock/oneclickvirt-qemu-dnat.lock
+flock -w 15 9 || exit 1
+if command -v iptables >/dev/null 2>&1 && iptables -w 10 -S LIBVIRT_FWI >/dev/null 2>&1; then
+    # libvirt may prepend its reject rules on DHCP updates. Reposition our
+    # exact owned exception instead of accepting a stale rule after reject.
+    while iptables -w 10 -C LIBVIRT_FWI -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT 2>/dev/null; do
+        iptables -w 10 -D LIBVIRT_FWI -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT
+    done
+    iptables -w 10 -I LIBVIRT_FWI 1 -d 192.168.122.0/24 -o "$bridge" -m conntrack --ctstate DNAT -m comment --comment oneclickvirt-qemu-dnat -j ACCEPT
+fi
+if command -v nft >/dev/null 2>&1 && nft list chain ip libvirt_network guest_input >/dev/null 2>&1; then
+    handles=$(nft -a list chain ip libvirt_network guest_input | awk '/comment "oneclickvirt-qemu-dnat"/ {for (i=1; i<NF; i++) if ($i=="handle") print $(i+1)}')
+    while IFS= read -r handle; do
+        [[ -n "$handle" ]] || continue
+        [[ "$handle" =~ ^[0-9]+$ ]] || exit 1
+        nft delete rule ip libvirt_network guest_input handle "$handle"
+    done <<< "$handles"
+    nft insert rule ip libvirt_network guest_input oifname "$bridge" ip daddr 192.168.122.0/24 ct status dnat accept comment '"oneclickvirt-qemu-dnat"'
+fi
+OCVHOOK
+    chmod 0755 "$hook_tmp" || { rm -f "$hook_tmp"; return 1; }
+    mv -f "$hook_tmp" "$hook" || { rm -f "$hook_tmp"; return 1; }
+    bash "$hook" --apply
 }
 
 fw_init_table() {
@@ -1387,46 +1458,59 @@ ensure_default_network() {
 # ======== 后台守护：等待 VM 准备就绪（SSH 可用） ========
 # 不再依赖 cloud-init shutdown + restart 循环（在 TCG 模式下极其缓慢）
 # VM 保持运行，cloud-init 在后台配置完成后 SSH 即可用
+wait_for_vm_ssh() {
+    local vm_name="$1" vm_ip="$2" max_wait="$3"
+    local deadline=$((SECONDS + max_wait)) state remaining probe_wait sleep_time
+    while (( SECONDS < deadline )); do
+        state=$(LC_ALL=C virsh domstate "$vm_name" 2>/dev/null || echo error)
+        if [[ "$state" != running ]]; then
+            # Starting is itself bounded; a permanently stopped/crashed guest
+            # must not bypass the overall readiness deadline.
+            remaining=$((deadline - SECONDS))
+            (( remaining > 0 )) || break
+            probe_wait=$((remaining < 15 ? remaining : 15))
+            timeout "$probe_wait" virsh start "$vm_name" >/dev/null 2>&1 || true
+        else
+            remaining=$((deadline - SECONDS))
+            (( remaining > 0 )) || break
+            probe_wait=$((remaining < 15 ? remaining : 15))
+            if timeout "$probe_wait" sshpass -e ssh -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$QEMU_READY_KNOWN_HOSTS" \
+                -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \
+                "root@${vm_ip}" 'test "$(id -u)" = 0 && { ! command -v cloud-init >/dev/null 2>&1 || cloud-init status --wait >/dev/null 2>&1; }' >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        sleep_time=$((remaining < 10 ? remaining : 10))
+        sleep "$sleep_time"
+    done
+    return 1
+}
+
 spawn_readiness_daemon() {
-    local vm_name="$1"
-    local vm_ip="$2"
-    local ssh_port="$3"
-    local log_file="/tmp/qemu-init-${vm_name}.log"
-    local max_wait_time=900
-    if [[ -e /dev/kvm ]]; then
-        max_wait_time=300  # KVM 模式 5 分钟就够了
-    fi
-    nohup bash -c "
-        echo \"[\$(date)] Waiting for VM ${vm_name} to become ready (SSH on ${vm_ip}:22)...\" >> \"${log_file}\"
-        echo \"[\$(date)] Max wait: ${max_wait_time}s\" >> \"${log_file}\"
-        max_wait=${max_wait_time}
-        elapsed=0
-        while true; do
-            state=\$(virsh domstate '${vm_name}' 2>/dev/null || echo 'error')
-            if [[ \"\$state\" != 'running' ]]; then
-                echo \"[\$(date)] VM ${vm_name} is not running (state=\${state}). Trying to start...\" >> \"${log_file}\"
-                virsh start '${vm_name}' >> \"${log_file}\" 2>&1 || true
-                sleep 10
-                (( elapsed += 10 ))
-                continue
-            fi
-            # 检查 SSH 是否可用
-            if timeout 3 bash -c \": >/dev/tcp/${vm_ip}/22\" >/dev/null 2>&1; then
-                echo \"[\$(date)] VM ${vm_name} is ready! SSH available on ${vm_ip}:22\" >> \"${log_file}\"
-                echo \"[\$(date)] Done.\" >> \"${log_file}\"
-                exit 0
-            fi
-            if (( elapsed >= max_wait )); then
-                echo \"[\$(date)] Timeout \${max_wait}s waiting for SSH. VM may need more time in TCG mode.\" >> \"${log_file}\"
-                exit 1
-            fi
-            sleep 10
-            (( elapsed += 10 ))
-            if (( elapsed % 60 == 0 )); then
-                echo \"[\$(date)] Still waiting... elapsed=\${elapsed}s state=\${state}\" >> \"${log_file}\"
-            fi
-        done
-    " >> "$log_file" 2>&1 &
+    local vm_name="$1" vm_ip="$2" ssh_port="$3"
+    local log_file max_wait_time=900
+    command -v sshpass >/dev/null 2>&1 || { _red "sshpass is required to verify VM password SSH"; return 1; }
+    log_file=$(mktemp "/tmp/qemu-init-${vm_name}.XXXXXX.log") || return 1
+    [[ ! -e /dev/kvm ]] || max_wait_time=300
+    # Pass the disposable credential only in the child environment, never in
+    # a daemon command argument or diagnostic log.
+    SSHPASS="$passwd" nohup bash -c '
+        eval "$1"
+        vm_name="$2"; vm_ip="$3"; max_wait="$4"
+        QEMU_READY_KNOWN_HOSTS=$(mktemp) || exit 1
+        cleanup_ready() { rm -f -- "$QEMU_READY_KNOWN_HOSTS"; }
+        trap cleanup_ready EXIT
+        echo "Waiting for password SSH and cloud-init on ${vm_name} (${vm_ip}:22); budget=${max_wait}s"
+        if wait_for_vm_ssh "$vm_name" "$vm_ip" "$max_wait"; then
+            echo "VM ${vm_name} is ready: root password SSH and cloud-init verified"
+        else
+            echo "Timeout waiting for VM ${vm_name} password SSH/cloud-init" >&2
+            exit 1
+        fi
+    ' _ "$(declare -f wait_for_vm_ssh)" "$vm_name" "$vm_ip" "$max_wait_time" >> "$log_file" 2>&1 &
     disown
     _yellow "  VM booting in background. SSH will become available when cloud-init finishes."
     _yellow "  Progress: tail -f ${log_file}"
@@ -1500,11 +1584,12 @@ main() {
     _yellow "Creating cloud-init configuration..."
     local ci_iso=""
     # 始终使用手动创建 ISO 的方式（更可靠，virt-install --cloud-init 存在 user-data 为空的 bug）
-    ci_iso=$(create_cloudinit_iso "$name" "$passwd") || { cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "$vm_disk" ""; _red "Failed to create cloud-init ISO"; exit 1; }
+    ci_iso=$(create_cloudinit_iso "$name" "$passwd" "$vm_mac") || { cleanup_partial_vm "$name" "$vm_ip" "$vm_mac" "$vm_disk" ""; _red "Failed to create cloud-init ISO"; exit 1; }
     _green "  ✓ cloud-init ISO: $ci_iso"
 
     # 配置端口转发
     detect_fw
+    install_libvirt_dnat_forwarding || { _red "Failed to configure libvirt DNAT forwarding"; exit 1; }
     fw_init_table
     fw_add_vm "$name" "$vm_ip" "$sshport" "$startport" "$endport"
     fw_save
@@ -1576,6 +1661,11 @@ except:
     local -a extra_opts=()
     if [[ "$ARCH_TYPE" == "aarch64" || "$ARCH_TYPE" == "arm64" ]]; then
         extra_opts=(--boot uefi=off)
+    else
+        # These cloud guests use BIOS, which does not need SMM. On affected
+        # Q35/KVM hosts SeaBIOS otherwise resets before the kernel can start.
+        # Keep the firmware explicit so this cannot disable SMM for Secure Boot.
+        extra_opts=(--boot uefi=off --features smm=off)
     fi
 
     local -a virt_cmd=(
@@ -1602,7 +1692,7 @@ except:
 
     if [[ $virt_rc -ne 0 ]]; then
         _yellow "virt-install failed (rc=$virt_rc), retrying with detect=on,require=off..."
-        virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
+        virsh undefine "$name" --nvram 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
         # 重建磁盘（可能被 undefine --remove-all-storage 删除）
         if [[ ! -f "$vm_disk" ]]; then
             vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to re-create VM disk"; exit 1; }
@@ -1633,7 +1723,7 @@ except:
     if [[ $virt_rc -ne 0 && "$virt_type" == "kvm" ]]; then
         _yellow "KVM mode failed, falling back to TCG (--virt-type qemu)..."
         virt_type="qemu"
-        virsh undefine "$name" --remove-all-storage 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
+        virsh undefine "$name" --nvram 2>/dev/null || virsh undefine "$name" 2>/dev/null || true
         if [[ ! -f "$vm_disk" ]]; then
             vm_disk=$(create_disk "$name" "$disk") || { _red "Failed to re-create VM disk"; exit 1; }
         fi
@@ -1668,6 +1758,7 @@ except:
         exit 1
     fi
 
+    install_libvirt_dnat_forwarding || { _red "Failed to restore libvirt DNAT forwarding after VM deployment"; exit 1; }
     _green "  ✓ VM created: $name"
 
     vm_ipv6=$(vm_ipv6_from_lease "$name" "$vm_mac")
@@ -1678,7 +1769,7 @@ except:
 
     # ── 后台守护进程监控 VM 就绪状态 ────────────────────
     # VM 保持运行，cloud-init 在后台配置，完成后 SSH 即可用
-    spawn_readiness_daemon "$name" "$vm_ip" "$sshport"
+    spawn_readiness_daemon "$name" "$vm_ip" "$sshport" || return 1
 
     # 检测公网 IP
     check_ipv4
