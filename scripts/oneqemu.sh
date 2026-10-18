@@ -1474,6 +1474,7 @@ wait_for_vm_ssh() {
             remaining=$((deadline - SECONDS))
             (( remaining > 0 )) || break
             probe_wait=$((remaining < 15 ? remaining : 15))
+            # shellcheck disable=SC2016 # id and cloud-init execute inside the guest.
             if timeout "$probe_wait" sshpass -e ssh -o ConnectTimeout=5 \
                 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$QEMU_READY_KNOWN_HOSTS" \
                 -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \
@@ -1497,6 +1498,7 @@ spawn_readiness_daemon() {
     [[ ! -e /dev/kvm ]] || max_wait_time=300
     # Pass the disposable credential only in the child environment, never in
     # a daemon command argument or diagnostic log.
+    # shellcheck disable=SC2016 # Positional arguments expand in the daemon shell.
     SSHPASS="$passwd" nohup bash -c '
         eval "$1"
         vm_name="$2"; vm_ip="$3"; max_wait="$4"
