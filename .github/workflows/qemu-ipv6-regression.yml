@@ -49,6 +49,7 @@ jobs:
           bash tests/noninteractive_mode_test.sh
           bash tests/image_source_test.sh
           bash tests/network_redefine_test.sh
+          bash tests/disk_capacity_test.sh
           bash tests/cloudinit_seed_test.sh
           bash tests/readiness_budget_test.sh
 

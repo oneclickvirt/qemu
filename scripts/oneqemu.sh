@@ -991,6 +991,16 @@ create_disk() {
     local vm_disk="${images_path}/vm-${vm_name}.qcow2"
 
     _yellow "Creating VM disk: ${vm_disk} (${disk_gb}GB backing ${system}.qcow2)" >&2
+    # A smaller overlay hides backing sectors and can strand GRUB in rescue.
+    local base_bytes
+    if ! base_bytes=$(qemu-img info --output=json "$base_img" | python3 -c 'import json,sys; n=json.load(sys.stdin)["virtual-size"]; assert isinstance(n,int) and n>0; print(n)'); then
+        echo "ERROR: cannot determine base image capacity: $base_img" >&2
+        return 1
+    fi
+    if [[ ! "$disk_gb" =~ ^[0-9]+$ ]] || (( 10#$disk_gb < (base_bytes + 1073741823) / 1073741824 )); then
+        echo "ERROR: requested disk is smaller than base image ($base_bytes bytes); increase disk allocation" >&2
+        return 1
+    fi
     # 从 cloud image 创建差量磁盘（backing store）
     if ! qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$vm_disk" "${disk_gb}G" >&2; then
         echo "ERROR: qemu-img create failed for $vm_disk" >&2
