@@ -70,6 +70,9 @@ for name in install_base_deps install_qemu_stack; do
                         ;;
                     '-y install '*)
                         mock_installs=$((mock_installs + 1))
+                        if [[ "$name" == install_qemu_stack ]]; then
+                            [[ " $* " == *" libvirt-daemon-driver-lxc "* ]] || fail "Debian QEMU container driver missing"
+                        fi
                         [[ "$scenario" != install_failed ]] || return 100
                         ;;
                     *) fail "Unexpected apt-get: $*" ;;

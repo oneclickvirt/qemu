@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 2026-10-21
+
+- Debian 系列安装时补齐 libvirt-daemon-driver-lxc，避免面板创建 libvirt-LXC 容器时缺少宿主驱动。
+- 安装回归测试校验 LXC 驱动依赖，保留包安装失败的错误传播。
+
 ## Unreleased
 
 - 统一支持 `noninteractive=true` 作为安装、创建、删除、卸载脚本的无交互开关。

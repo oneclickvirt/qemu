@@ -464,6 +464,7 @@ install_qemu_stack() {
                 qemu-kvm \
                 qemu-system \
                 libvirt-daemon-system \
+                libvirt-daemon-driver-lxc \
                 libvirt-clients \
                 virtinst \
                 qemu-utils \
