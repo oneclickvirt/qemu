@@ -1,0 +1,33 @@
+{
+  "repository": "oneclickvirt/qemu",
+  "branch": "main",
+  "skill_name": "oneclickvirt-qemu",
+  "purpose": "Operate and troubleshoot qemu instances deployed with the OneClickVirt scripts.",
+  "notes": [
+    "Read the platform precheck and installation pages before changing a host.",
+    "Use the existing host runtime and its credentials. Instance IDs and names remain the native runtime identifiers.",
+    "MCP starts read-only. Set ONECLICKVIRT_MCP_ALLOW_WRITE=1 on the intended host to expose start, graceful stop and restart; deletion, reinstall and arbitrary shell commands are not exposed.",
+    "Use local libvirt; ONECLICKVIRT_LIBVIRT_URI accepts qemu:///system or qemu:///session."
+  ],
+  "guide": "https://www.spiritlhl.net/guide/agent_integrations.html",
+  "releases": false,
+  "runtime": "qemu",
+  "binary": "virsh",
+  "platform_guide": "https://www.spiritlhl.net/guide/qemu/qemu_precheck.html",
+  "mcp": true,
+  "source_files": [
+    "qemuinstall.sh",
+    "qemuuninstall.sh",
+    "scripts/create_qemu.sh",
+    "scripts/delete_qemu.sh",
+    "scripts/manage_qemu.sh",
+    "scripts/oneqemu.sh"
+  ],
+  "purpose_zh": "通过本机 libvirt 管理和排查 OneClickVirt QEMU 虚拟机。",
+  "notes_zh": [
+    "变更宿主机前，先阅读平台准备和安装页。",
+    "使用本机已有运行环境及凭据；实例名称和 ID 保持原运行环境的标识。",
+    "MCP 默认只读。在目标主机设置 ONECLICKVIRT_MCP_ALLOW_WRITE=1 后才提供启动、正常关机和重启；不提供删除、重装或任意 Shell 执行。",
+    "ONECLICKVIRT_LIBVIRT_URI 仅接受本机 qemu:///system 或 qemu:///session。"
+  ]
+}
