@@ -42,4 +42,4 @@
 
 ## Stargazers over time
 
-[![Stargazers over time](https://starchart.cc/oneclickvirt/qemu.svg)](https://starchart.cc/oneclickvirt/qemu)
+[![Stargazers over time](https://api.star-history.com/chart?repos=oneclickvirt/qemu&type=date)](https://starchart.cc/oneclickvirt/qemu)
